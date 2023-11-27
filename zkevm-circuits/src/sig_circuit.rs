@@ -44,7 +44,9 @@ use halo2_ecc::{
 };
 
 mod ecdsa;
-mod utils;
+
+#[allow(missing_docs)]
+pub mod utils;
 #[cfg(any(feature = "test", test, feature = "test-circuits"))]
 pub(crate) use utils::*;
 
@@ -74,13 +76,13 @@ pub struct SigCircuitConfigArgs<F: Field> {
 #[derive(Debug, Clone)]
 pub struct SigCircuitConfig<F: Field> {
     /// ECDSA
-    ecdsa_config: FpChip<F>,
+    pub ecdsa_config: FpChip<F>,
     /// An advice column to store RLC witnesses
     rlc_column: Column<Advice>,
     /// selector for keccak lookup table
     q_keccak: Selector,
     /// Used to lookup pk->pk_hash(addr)
-    keccak_table: KeccakTable,
+    pub keccak_table: KeccakTable,
     /// The exposed table to be used by tx circuit and ecrecover
     sig_table: SigTable,
 }
@@ -741,7 +743,7 @@ impl<F: Field> SigCircuit<F> {
     }
 
     /// Assign witness data to the sig circuit.
-    pub(crate) fn assign(
+    pub fn assign(
         &self,
         config: &SigCircuitConfig<F>,
         layouter: &mut impl Layouter<F>,

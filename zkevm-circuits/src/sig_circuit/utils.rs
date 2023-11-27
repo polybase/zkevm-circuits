@@ -76,15 +76,15 @@ pub(crate) struct AssignedECDSA<F: Field, FC: FieldChip<F>> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AssignedSignatureVerify<F: Field> {
-    pub(crate) address: AssignedValue<F>,
-    pub(crate) msg_len: usize,
-    pub(crate) msg_rlc: Value<F>,
-    pub(crate) msg_hash_rlc: AssignedValue<F>,
-    pub(crate) r_rlc: AssignedValue<F>,
-    pub(crate) s_rlc: AssignedValue<F>,
-    pub(crate) v: AssignedValue<F>,
-    pub(crate) sig_is_valid: AssignedValue<F>,
+pub struct AssignedSignatureVerify<F: Field> {
+    pub address: AssignedValue<F>,
+    pub msg_len: usize,
+    pub msg_rlc: Value<F>,
+    pub msg_hash_rlc: AssignedValue<F>,
+    pub r_rlc: AssignedValue<F>,
+    pub s_rlc: AssignedValue<F>,
+    pub v: AssignedValue<F>,
+    pub sig_is_valid: AssignedValue<F>,
 }
 
 pub(super) struct SignDataDecomposed<F: Field> {

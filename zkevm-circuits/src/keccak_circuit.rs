@@ -876,7 +876,7 @@ impl<F: Field> SubCircuitConfig<F> for KeccakCircuitConfig<F> {
 
 impl<F: Field> KeccakCircuitConfig<F> {
     /// Assign the circuit for hash function
-    pub(crate) fn assign(
+    pub fn assign(
         &self,
         layouter: &mut impl Layouter<F>,
         witness: &[KeccakRow<F>],
