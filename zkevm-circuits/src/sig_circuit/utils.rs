@@ -65,10 +65,11 @@ pub(super) type FqChip<F> = FpConfig<F, Fq>;
 /// Chip to handle ECDSA::Fp, the base field
 pub(super) type FpChip<F> = FpConfig<F, Fp>;
 
-pub(crate) struct AssignedECDSA<F: Field, FC: FieldChip<F>> {
+#[derive(Debug, Clone)]
+pub struct AssignedECDSA<F: Field, FC: FieldChip<F>> {
     pub(super) pk: EcPoint<F, FC::FieldPoint>,
     pub(super) pk_is_zero: AssignedValue<F>,
-    pub(super) msg_hash: CRTInteger<F>,
+    pub msg_hash: CRTInteger<F>,
     pub(super) integer_r: CRTInteger<F>,
     pub(super) integer_s: CRTInteger<F>,
     pub(super) v: AssignedValue<F>,
@@ -77,6 +78,7 @@ pub(crate) struct AssignedECDSA<F: Field, FC: FieldChip<F>> {
 
 #[derive(Debug, Clone)]
 pub struct AssignedSignatureVerify<F: Field> {
+    pub assigned_ecdsa: AssignedECDSA<F, FpConfig<F, Fp>>,
     pub address: AssignedValue<F>,
     pub msg_len: usize,
     pub msg_rlc: Value<F>,

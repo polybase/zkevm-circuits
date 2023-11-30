@@ -728,6 +728,7 @@ impl<F: Field> SigCircuit<F> {
         log::trace!("finished sign verify");
         let to_be_keccak_checked = [sign_data_decomposed.is_address_zero, pk_rlc, pk_hash_rlc];
         let assigned_sig_verif = AssignedSignatureVerify {
+            assigned_ecdsa: assigned_ecdsa.clone(),
             address: sign_data_decomposed.address,
             msg_len: sign_data.msg.len(),
             msg_rlc: challenges
