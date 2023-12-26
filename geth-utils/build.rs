@@ -4,6 +4,24 @@ use std::{
 };
 
 fn main() {
+    if let Some(target) = env::var("TARGET").ok() {
+        if target.contains("android") || target.contains("ios") {
+            println!("cargo:warning=Building for Android or iOS");
+            return;
+        }
+    } else {
+        println!("cargo:warning=Building for non-mobile platforms");
+    }
+
+    if let Some(target) = env::var("TARGET").ok() {
+        if target.contains("android") {
+            println!("cargo:warning=Building for Android");
+            return;
+        }
+    } else {
+        println!("cargo:warning=Building for non-Android");
+    }
+
     let lib_name = "go-geth-utils";
     let out_dir = env::var("OUT_DIR").unwrap();
 
