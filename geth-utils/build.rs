@@ -13,6 +13,14 @@ fn main() {
         println!("cargo:warning=Building for non-mobile platforms");
     }
 
+    if let Some(docker_build_env) = std::env::var("DOCKER_BUILD_ENV").ok() {
+        println!(
+            "cargo:warning=DOCKER_BUILD_ENV is set to: {}",
+            docker_build_env
+        );
+        return;
+    }
+
     let lib_name = "go-geth-utils";
     let out_dir = env::var("OUT_DIR").unwrap();
 
