@@ -5,7 +5,7 @@ use std::{
 
 fn main() {
     if let Ok(target) = env::var("TARGET") {
-        if target.contains("android") || target.contains("ios") {
+        if target.contains("android") || target.contains("ios") || target.contains("wasm") {
             println!("cargo:warning=Building for Android or iOS");
             return;
         }
