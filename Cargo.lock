@@ -5929,7 +5929,7 @@ dependencies = [
 [[package]]
 name = "zktrie"
 version = "0.2.0"
-source = "git+https://github.com/polybase/zktrie/?branch=bypass-builds-on-android-and-ios#5c2ff7455d8e1472a2ea43900b3fa52ec5c8137d"
+source = "git+https://github.com/polybase/zktrie/?branch=bypass-builds-on-android-and-ios-dev#4e634753d5ff00e58e554d2ac9cf4dbeb1b58b29"
 dependencies = [
  "gobuild 0.1.0-alpha.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
