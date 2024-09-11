@@ -31,11 +31,12 @@ use halo2_proofs::plonk::SecondPhase;
 #[cfg(not(feature = "onephase"))]
 use halo2_proofs::plonk::ThirdPhase;
 
-use eth_types::{Field, Word, U256};
+use crate::util::Field;
+use eth_types::{Word, U256};
 pub(crate) use halo2_proofs::circuit::{Layouter, Value};
 use halo2_proofs::{
     circuit::SimpleFloorPlanner,
-    dev::MockProver,
+    dev::{MockProver, VerifyFailure},
     plonk::{Circuit, ConstraintSystem, Error, Selector},
 };
 
@@ -54,7 +55,7 @@ pub(crate) const WORD_SIGNED_MAX: Word = U256([u64::MAX, u64::MAX, u64::MAX, i64
 pub(crate) const WORD_SIGNED_MIN: Word = U256([0, 0, 0, i64::MIN as _]);
 
 pub(crate) fn generate_power_of_randomness<F: Field>(randomness: F) -> Vec<F> {
-    (1..32).map(|exp| randomness.pow(&[exp, 0, 0, 0])).collect()
+    (1..32).map(|exp| randomness.pow([exp, 0, 0, 0])).collect()
 }
 
 pub(crate) trait MathGadgetContainer<F: Field>: Clone {
@@ -90,7 +91,7 @@ pub(crate) struct UnitTestMathGadgetBaseCircuit<G> {
 }
 
 impl<G> UnitTestMathGadgetBaseCircuit<G> {
-    fn new(size: usize, witnesses: Vec<Word>) -> Self {
+    pub(crate) fn new(size: usize, witnesses: Vec<Word>) -> Self {
         UnitTestMathGadgetBaseCircuit {
             size,
             witnesses,
@@ -102,6 +103,8 @@ impl<G> UnitTestMathGadgetBaseCircuit<G> {
 impl<F: Field, G: MathGadgetContainer<F>> Circuit<F> for UnitTestMathGadgetBaseCircuit<G> {
     type Config = (UnitTestMathGadgetBaseCircuitConfig<F, G>, Challenges);
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         UnitTestMathGadgetBaseCircuit {
@@ -203,6 +206,7 @@ impl<F: Field, G: MathGadgetContainer<F>> Circuit<F> for UnitTestMathGadgetBaseC
                     &challenge_values,
                     config.advices.to_vec(),
                     MAX_STEP_HEIGHT * 3,
+                    MAX_STEP_HEIGHT * 3,
                     offset,
                 );
                 config.step.state.execution_state.assign(
@@ -223,7 +227,7 @@ impl<F: Field, G: MathGadgetContainer<F>> Circuit<F> for UnitTestMathGadgetBaseC
         )?;
 
         // assign fixed range tables only as they are the only tables referred by a
-        // specfic math gadget -- ConstantDivisionGadget.
+        // specific math gadget -- ConstantDivisionGadget.
         layouter.assign_region(
             || "fixed table",
             |mut region| {
@@ -289,3 +293,29 @@ macro_rules! try_test {
 
 #[cfg(test)]
 pub(crate) use try_test;
+
+// for negative test used.
+pub(crate) fn assert_error_matches(result: Result<(), Vec<VerifyFailure>>, name: &str) {
+    let errors = result.expect_err("result is not an error");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    match &errors[0] {
+        VerifyFailure::ConstraintNotSatisfied { constraint, .. } => {
+            let constraint = format!("{constraint}");
+
+            // here use assert ?
+            if !constraint.contains(name) {
+                panic!("{constraint} does not contain {name}");
+            }
+        }
+        // TODO: not support following error now.
+        VerifyFailure::Lookup {
+            name: _lookup_name, ..
+        } => panic!(),
+        VerifyFailure::CellNotAssigned { .. } => panic!(),
+        VerifyFailure::ConstraintPoisoned { .. } => panic!(),
+        VerifyFailure::Permutation { .. } => panic!(),
+        &VerifyFailure::InstanceCellNotAssigned { .. } | &VerifyFailure::Shuffle { .. } => {
+            todo!()
+        }
+    }
+}

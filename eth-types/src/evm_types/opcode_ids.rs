@@ -1,14 +1,15 @@
 //! Doc this
 use crate::{error::Error, evm_types::GasCost};
 use core::fmt::Debug;
-use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{de, Deserialize, Serialize};
-use std::{fmt, matches, str::FromStr};
+use std::{fmt, marker::ConstParamTy, matches, str::FromStr, sync::LazyLock};
 use strum_macros::EnumIter;
 
 /// Opcode enum. One-to-one corresponding to an `u8` value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Hash, EnumIter, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Serialize, Hash, EnumIter, PartialOrd, Ord, ConstParamTy,
+)]
 pub enum OpcodeId {
     /// `STOP`
     STOP,
@@ -93,6 +94,8 @@ pub enum OpcodeId {
     MSIZE,
     /// `JUMPDEST`
     JUMPDEST,
+    /// `MCOPY`
+    MCOPY,
 
     // PUSHn
     /// `PUSH0`
@@ -287,6 +290,10 @@ pub enum OpcodeId {
     SSTORE,
     /// `GAS`
     GAS,
+    /// `TLOAD`
+    TLOAD,
+    /// `TSTORE`
+    TSTORE,
 
     // LOGn
     /// `LOG0`
@@ -317,15 +324,9 @@ pub enum OpcodeId {
 }
 
 impl OpcodeId {
-    #[cfg(feature = "shanghai")]
     /// Returns `true` if the `OpcodeId` is a `PUSHn` (including `PUSH0`).
     pub fn is_push(&self) -> bool {
         self.as_u8() >= Self::PUSH0.as_u8() && self.as_u8() <= Self::PUSH32.as_u8()
-    }
-    #[cfg(not(feature = "shanghai"))]
-    /// Returns `true` if the `OpcodeId` is a `PUSHn`.
-    pub fn is_push(&self) -> bool {
-        self.as_u8() >= Self::PUSH1.as_u8() && self.as_u8() <= Self::PUSH32.as_u8()
     }
 
     /// Returns `true` if the `OpcodeId` is a `PUSH1` .. `PUSH32` (excluding `PUSH0`).
@@ -425,6 +426,7 @@ impl OpcodeId {
             OpcodeId::PC => 0x58u8,
             OpcodeId::MSIZE => 0x59u8,
             OpcodeId::JUMPDEST => 0x5bu8,
+            OpcodeId::MCOPY => 0x5eu8,
             OpcodeId::PUSH0 => 0x5fu8,
             OpcodeId::PUSH1 => 0x60u8,
             OpcodeId::PUSH2 => 0x61u8,
@@ -517,6 +519,8 @@ impl OpcodeId {
             OpcodeId::SLOAD => 0x54u8,
             OpcodeId::SSTORE => 0x55u8,
             OpcodeId::GAS => 0x5au8,
+            OpcodeId::TLOAD => 0x5cu8,
+            OpcodeId::TSTORE => 0x5du8,
             OpcodeId::LOG0 => 0xa0u8,
             OpcodeId::LOG1 => 0xa1u8,
             OpcodeId::LOG2 => 0xa2u8,
@@ -604,6 +608,9 @@ impl OpcodeId {
             OpcodeId::MSIZE => GasCost::QUICK,
             OpcodeId::GAS => GasCost::QUICK,
             OpcodeId::JUMPDEST => GasCost::ONE,
+            OpcodeId::MCOPY => GasCost::FASTEST,
+            OpcodeId::TLOAD => GasCost::WARM_ACCESS,
+            OpcodeId::TSTORE => GasCost::WARM_ACCESS,
             OpcodeId::PUSH0 => GasCost::QUICK,
             OpcodeId::PUSH1 => GasCost::FASTEST,
             OpcodeId::PUSH2 => GasCost::FASTEST,
@@ -701,7 +708,7 @@ impl OpcodeId {
         let (min_stack_ptr, max_stack_ptr): (u32, u32) = match self {
             // `min_stack_pointer` 0 means stack overflow never happen, for example, `OpcodeId::ADD`
             // can only encounter underflow error, but never encounter overflow error.
-            // `max_stack_pointer` means max stack poniter for op code normally run. for example,
+            // `max_stack_pointer` means max stack pointer for op code normally run. for example,
             // `OpcodeId::ADD` 's max stack pointer is 1022, when actual sp > 1022, will
             // encounter underflow error.
             OpcodeId::STOP => (0, 1024),
@@ -768,6 +775,9 @@ impl OpcodeId {
             OpcodeId::MSIZE => (1, 1024),
             OpcodeId::GAS => (1, 1024),
             OpcodeId::JUMPDEST => (0, 1024),
+            OpcodeId::MCOPY => (0, 1021),
+            OpcodeId::TLOAD => (0, 1023),
+            OpcodeId::TSTORE => (0, 1022),
             OpcodeId::PUSH0 => (1, 1024),
             OpcodeId::PUSH1 => (1, 1024),
             OpcodeId::PUSH2 => (1, 1024),
@@ -866,6 +876,7 @@ impl OpcodeId {
                 | OpcodeId::RETURNDATACOPY
                 | OpcodeId::CODECOPY
                 | OpcodeId::EXTCODECOPY
+                | OpcodeId::MCOPY
         )
     }
 
@@ -969,7 +980,9 @@ impl From<u8> for OpcodeId {
             0x58u8 => OpcodeId::PC,
             0x59u8 => OpcodeId::MSIZE,
             0x5bu8 => OpcodeId::JUMPDEST,
-            #[cfg(feature = "shanghai")]
+            0x5cu8 => OpcodeId::TLOAD,
+            0x5du8 => OpcodeId::TSTORE,
+            0x5eu8 => OpcodeId::MCOPY,
             0x5fu8 => OpcodeId::PUSH0,
             0x60u8 => OpcodeId::PUSH1,
             0x61u8 => OpcodeId::PUSH2,
@@ -1058,7 +1071,6 @@ impl From<u8> for OpcodeId {
             0x45u8 => OpcodeId::GASLIMIT,
             0x46u8 => OpcodeId::CHAINID,
             0x47u8 => OpcodeId::SELFBALANCE,
-            #[cfg(not(feature = "scroll"))]
             0x48u8 => OpcodeId::BASEFEE,
             0x54u8 => OpcodeId::SLOAD,
             0x55u8 => OpcodeId::SSTORE,
@@ -1126,10 +1138,10 @@ impl FromStr for OpcodeId {
             "PC" => OpcodeId::PC,
             "MSIZE" => OpcodeId::MSIZE,
             "JUMPDEST" => OpcodeId::JUMPDEST,
-            #[cfg(feature = "shanghai")]
+            // tmp hack before reverting https://github.com/scroll-tech/go-ethereum/pull/737/files
+            "opcode 0x5e not defined" => OpcodeId::MCOPY,
+            "MCOPY" => OpcodeId::MCOPY,
             "PUSH0" => OpcodeId::PUSH0,
-            #[cfg(not(feature = "shanghai"))]
-            "PUSH0" => OpcodeId::INVALID(0x5f),
             "PUSH1" => OpcodeId::PUSH1,
             "PUSH2" => OpcodeId::PUSH2,
             "PUSH3" => OpcodeId::PUSH3,
@@ -1235,18 +1247,19 @@ impl FromStr for OpcodeId {
             #[cfg(not(feature = "scroll"))]
             "SELFDESTRUCT" => OpcodeId::SELFDESTRUCT,
             "CHAINID" => OpcodeId::CHAINID,
-            #[cfg(not(feature = "scroll"))]
+            "opcode 0x48 not defined" => OpcodeId::BASEFEE,
             "BASEFEE" => OpcodeId::BASEFEE,
-            #[cfg(feature = "scroll")]
-            "BASEFEE" => OpcodeId::INVALID(0x48),
-            "TLOAD" => OpcodeId::INVALID(0xb3),
-            "TSTORE" => OpcodeId::INVALID(0xb4),
+            "BLOBHASH" => OpcodeId::INVALID(0x49),
+            "BLOBBASEFEE" => OpcodeId::INVALID(0x4a),
+            "opcode 0x5c not defined" => OpcodeId::TLOAD,
+            "TLOAD" => OpcodeId::TLOAD,
+            "opcode 0x5d not defined" => OpcodeId::TSTORE,
+            "TSTORE" => OpcodeId::TSTORE,
             _ => {
                 // Parse an invalid opcode value as reported by geth
-                lazy_static! {
-                    static ref RE: Regex = Regex::new("opcode 0x([[:xdigit:]]{1,2}) not defined")
-                        .expect("invalid regex");
-                }
+                static RE: LazyLock<Regex> = LazyLock::new(|| {
+                    Regex::new("opcode 0x([[:xdigit:]]{1,2}) not defined").expect("invalid regex")
+                });
                 if let Some(cap) = RE.captures(s) {
                     if let Some(byte_hex) = cap.get(1).map(|m| m.as_str()) {
                         return Ok(OpcodeId::INVALID(
@@ -1282,13 +1295,7 @@ mod opcode_ids_tests {
 
     #[test]
     fn push_n() {
-        #[cfg(feature = "shanghai")]
         assert!(matches!(OpcodeId::push_n(0), Ok(OpcodeId::PUSH0)));
-        #[cfg(not(feature = "shanghai"))]
-        assert!(matches!(
-            OpcodeId::push_n(0),
-            Err(Error::InvalidOpConversion)
-        ));
         assert!(matches!(OpcodeId::push_n(1), Ok(OpcodeId::PUSH1)));
         assert!(matches!(OpcodeId::push_n(10), Ok(OpcodeId::PUSH10)));
         assert!(matches!(
@@ -1299,10 +1306,7 @@ mod opcode_ids_tests {
 
     #[test]
     fn postfix() {
-        #[cfg(feature = "shanghai")]
         assert_eq!(OpcodeId::PUSH0.postfix(), Some(0));
-        #[cfg(not(feature = "shanghai"))]
-        assert_eq!(OpcodeId::PUSH0.postfix(), None);
         assert_eq!(OpcodeId::PUSH1.postfix(), Some(1));
         assert_eq!(OpcodeId::PUSH10.postfix(), Some(10));
         assert_eq!(OpcodeId::LOG2.postfix(), Some(2));

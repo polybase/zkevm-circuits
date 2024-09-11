@@ -5,7 +5,9 @@ use crate::{
         step::ExecutionState,
         util::{
             and,
-            common_gadget::{CommonCallGadget, TransferGadget, TransferGadgetInfo},
+            common_gadget::{
+                BytecodeLookupGadget, CommonCallGadget, TransferGadget, TransferGadgetInfo,
+            },
             constraint_builder::{
                 ConstrainBuilderCommon, EVMConstraintBuilder, ReversionInfo, StepStateTransition,
                 Transition::{Delta, To},
@@ -21,17 +23,17 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::{AccountFieldTag, CallContextFieldTag},
-    util::Expr,
+    util::{Expr, Field},
 };
 use bus_mapping::{
-    circuit_input_builder::CopyDataType,
-    evm::OpcodeId,
-    precompile::{is_precompiled, PrecompileCalls},
+    circuit_input_builder::CopyDataType, evm::OpcodeId, precompile::PrecompileCalls,
 };
 use eth_types::{
     evm_types::{memory::MemoryWordRange, GAS_STIPEND_CALL_WITH_VALUE},
-    Field, ToAddress, ToBigEndian, ToLittleEndian, ToScalar, U256,
+    utils::is_precompiled,
+    ToAddress, ToBigEndian, ToLittleEndian, U256,
 };
+use gadgets::ToScalar;
 use halo2_proofs::{circuit::Value, plonk::Error};
 use log::trace;
 use std::cmp::min;
@@ -42,7 +44,7 @@ use std::cmp::min;
 #[derive(Clone, Debug)]
 
 pub(crate) struct CallOpGadget<F> {
-    opcode: Cell<F>,
+    opcode_gadget: BytecodeLookupGadget<F>,
     is_call: IsZeroGadget<F>,
     is_callcode: IsZeroGadget<F>,
     is_delegatecall: IsZeroGadget<F>,
@@ -91,14 +93,20 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
     const EXECUTION_STATE: ExecutionState = ExecutionState::CALL_OP;
 
     fn configure(cb: &mut EVMConstraintBuilder<F>) -> Self {
-        let opcode = cb.query_cell();
-        cb.opcode_lookup(opcode.expr(), 1.expr());
-        let is_call = IsZeroGadget::construct(cb, opcode.expr() - OpcodeId::CALL.expr());
-        let is_callcode = IsZeroGadget::construct(cb, opcode.expr() - OpcodeId::CALLCODE.expr());
-        let is_delegatecall =
-            IsZeroGadget::construct(cb, opcode.expr() - OpcodeId::DELEGATECALL.expr());
-        let is_staticcall =
-            IsZeroGadget::construct(cb, opcode.expr() - OpcodeId::STATICCALL.expr());
+        let opcode_gadget = BytecodeLookupGadget::construct(cb);
+
+        let is_call =
+            IsZeroGadget::construct(cb, opcode_gadget.opcode.expr() - OpcodeId::CALL.expr());
+        let is_callcode =
+            IsZeroGadget::construct(cb, opcode_gadget.opcode.expr() - OpcodeId::CALLCODE.expr());
+        let is_delegatecall = IsZeroGadget::construct(
+            cb,
+            opcode_gadget.opcode.expr() - OpcodeId::DELEGATECALL.expr(),
+        );
+        let is_staticcall = IsZeroGadget::construct(
+            cb,
+            opcode_gadget.opcode.expr() - OpcodeId::STATICCALL.expr(),
+        );
 
         // Use rw_counter of the step which triggers next call as its call_id.
         let callee_call_id = cb.curr.state.rw_counter.clone();
@@ -336,6 +344,7 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
                         call_gadget.callee_address_expr(),
                     ),
                     (CallContextFieldTag::CallerId, cb.curr.state.call_id.expr()),
+                    (CallContextFieldTag::IsRoot, 0.expr()),
                     (
                         CallContextFieldTag::CallDataOffset,
                         call_gadget.cd_address.offset(),
@@ -360,7 +369,7 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
                         value,
                     );
                 }
-                // rwc_delta = 25 + is_call_or_callcode + transfer + is_delegatecall * 2
+                // rwc_delta = 26 + is_call_or_callcode + transfer + is_delegatecall * 2
 
                 // Save caller's call state
                 for (field_tag, value) in [
@@ -394,12 +403,13 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
                 ] {
                     cb.call_context_lookup(true.expr(), None, field_tag, value);
                 }
-                // rwc_delta = 33 + is_call_or_callcode + transfer + is_delegatecall * 2
+                // rwc_delta = 34 + is_call_or_callcode + transfer + is_delegatecall * 2
 
                 // copy table lookup to verify the copying of bytes:
                 // - from caller's memory (`call_data_length` bytes starting at `call_data_offset`)
                 // - to the precompile input.
                 let precompile_input_bytes_rlc =
+                    // cd_address.has_length is not zero means call_data_length > 0
                     cb.condition(call_gadget.cd_address.has_length(), |cb| {
                         let precompile_input_bytes_rlc = cb.query_cell_phase2();
                         cb.copy_table_lookup(
@@ -465,15 +475,15 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
                             precompile_return_data_copy_size.min(),
                             call_gadget.rd_address.offset(),
                             precompile_return_data_copy_size.min(),
-                            0.expr(),
+                            0.expr(), // Memory to Memory copy has no RLC accumulation.
                             precompile_return_rws.expr(), // writes
                         ); // rwc_delta += `return_data_copy_size.min()` for precompile
                         precompile_return_bytes_rlc
                     },
                 );
 
-                // +15 call context lookups for precompile.
-                let rw_counter_delta = 15.expr()
+                // +16 call context lookups for precompile.
+                let rw_counter_delta = 16.expr()
                     + rw_counter_delta.expr()
                     + precompile_input_rws.expr()
                     + precompile_output_rws.expr()
@@ -490,26 +500,18 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
                     is_create: To(false.expr()),
                     code_hash: To(cb.empty_code_hash_rlc()),
                     program_counter: Delta(1.expr()),
-                    stack_pointer: Delta(stack_pointer_delta.expr()),
                     gas_left: To(callee_gas_left.expr()),
                     memory_word_size: To(precompile_output_rws.expr()),
                     reversible_write_counter: To(callee_reversible_rwc_delta.expr()),
-                    ..StepStateTransition::default()
+                    ..StepStateTransition::new_context()
                 });
 
                 let precompile_gadget = PrecompileGadget::construct(
                     cb,
-                    call_gadget.is_success.expr(),
                     call_gadget.callee_address_expr(),
-                    cb.curr.state.call_id.expr(),
-                    call_gadget.cd_address.offset(),
-                    call_gadget.cd_address.length(),
-                    call_gadget.rd_address.offset(),
-                    call_gadget.rd_address.length(),
-                    precompile_return_length.expr(),
                     precompile_input_bytes_rlc.expr(),
-                    precompile_output_bytes_rlc.expr(),
-                    precompile_return_bytes_rlc.expr(),
+                    Some(precompile_output_bytes_rlc.expr()),
+                    Some(precompile_return_bytes_rlc.expr()),
                 );
 
                 (
@@ -714,7 +716,7 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
         );
 
         Self {
-            opcode,
+            opcode_gadget,
             is_call,
             is_callcode,
             is_delegatecall,
@@ -760,7 +762,7 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _tx: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -780,7 +782,8 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
 
         self.is_depth_ok
             .assign(region, offset, F::from(depth.low_u64()), F::from(1025))?;
-
+        self.opcode_gadget
+            .assign(region, offset, block, call, step)?;
         // This offset is used to change the index offset of `step.rw_indices`.
         // Since both CALL and CALLCODE have an extra stack pop `value`, and
         // opcode DELEGATECALL has two extra call context lookups - current
@@ -818,7 +821,7 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
         let is_precheck_ok =
             depth.low_u64() < 1025 && (!(is_call || is_callcode) || caller_balance >= value);
 
-        // only call opcode do transfer in sucessful case.
+        // only call opcode do transfer in successful case.
         if is_call && is_precheck_ok && !value.is_zero() {
             let transfer_assign_result = self.transfer.assign_from_rws(
                 region,
@@ -847,8 +850,6 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
             }
         }
 
-        self.opcode
-            .assign(region, offset, Value::known(F::from(opcode.as_u64())))?;
         self.is_call.assign(
             region,
             offset,
@@ -958,7 +959,7 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
             .assign(region, offset, code_address, 0x0Au64.into())?;
         log::trace!("callop is precompile call {}", is_precompile_call);
         let precompile_return_length = if is_precompile_call && is_precheck_ok {
-            rws.offset_add(14); // skip
+            rws.offset_add(15); // skip
             let value_rw = rws.next();
             assert_eq!(
                 value_rw.field_tag(),
@@ -1063,9 +1064,13 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
                 .map(|_| rws.next().memory_word_pair().0)
                 .flat_map(|word| word.to_be_bytes())
                 .collect::<Vec<_>>();
-            let return_bytes = (0..return_bytes_word_count * 2)
-                .step_by(2)
-                .map(|_| rws.next().memory_word_pair().0)
+            let return_bytes = (0..return_bytes_word_count)
+                .map(|_| {
+                    let _read_word = rws.next();
+
+                    // write word.
+                    rws.next().memory_word_pair().0
+                })
                 .flat_map(|word| word.to_be_bytes())
                 .collect::<Vec<_>>();
 
@@ -1141,14 +1146,8 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
             .assign(region, offset, return_rws)?;
 
         if is_precompile_call {
-            self.precompile_gadget.assign(
-                region,
-                offset,
-                precompile_addr.0[19].into(),
-                precompile_input_bytes_rlc,
-                cd_length.as_u64(),
-                region.challenges().keccak_input(),
-            )?;
+            self.precompile_gadget
+                .assign(region, offset, precompile_addr.0[19].into())?;
         }
 
         Ok(())
@@ -1158,26 +1157,28 @@ impl<F: Field> ExecutionGadget<F> for CallOpGadget<F> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{
-        mpt_circuit::MptCircuit, test_util::CircuitTestBuilder, util::SubCircuit,
-        witness::block_convert,
-    };
-    use bus_mapping::{circuit_input_builder::CircuitsParams, mock::BlockData};
+    use crate::test_util::CircuitTestBuilder;
+    use bus_mapping::circuit_input_builder::CircuitsParams;
     use eth_types::{
-        address, bytecode,
-        evm_types::OpcodeId,
-        geth_types::{Account, GethData},
-        word, Address, ToWord, Word,
+        address, bytecode, evm_types::OpcodeId, geth_types::Account, word, Address, ToWord, Word,
     };
-    use halo2_proofs::{dev::MockProver, halo2curves::bn256::Fr};
     use itertools::Itertools;
     use mock::{
         test_ctx::helpers::{account_0_code_account_1_no_code, tx_from_1_to_0},
         TestContext,
     };
-
     use rayon::prelude::{ParallelBridge, ParallelIterator};
     use std::default::Default;
+
+    #[cfg(feature = "scroll")]
+    mod scroll_imports {
+        pub use crate::{mpt_circuit::MptCircuit, util::SubCircuit, witness::block_convert};
+        pub use bus_mapping::mock::BlockData;
+        pub use eth_types::geth_types::GethData;
+        pub use halo2_proofs::{dev::MockProver, halo2curves::bn256::Fr};
+    }
+    #[cfg(feature = "scroll")]
+    use scroll_imports::*;
 
     const TEST_CALL_OPCODES: &[OpcodeId] = &[
         OpcodeId::CALL,
@@ -1276,8 +1277,8 @@ mod test {
 
         TEST_CALL_OPCODES
             .iter()
-            .cartesian_product(stacks.into_iter())
-            .cartesian_product(callees.into_iter())
+            .cartesian_product(stacks)
+            .cartesian_product(callees)
             .par_bridge()
             .for_each(|((opcode, stack), callee)| {
                 test_ok(caller(opcode, stack, true), callee, None);
@@ -1569,6 +1570,7 @@ mod test {
 
     // maybe consider to move to mpt_circuit module
     #[cfg(feature = "scroll")]
+    #[ignore]
     #[test]
     fn call_non_exist_with_value_mpt_circuit() {
         let callee_code = bytecode! {
@@ -1597,8 +1599,7 @@ mod test {
         builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
-        let mut block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
-        block.mpt_updates.mock_fill_state_roots();
+        let block = block_convert(&builder.block, &builder.code_db).unwrap();
         let mpt_circuit = MptCircuit::new_from_block(&block);
         let prover = MockProver::<Fr>::run(12, &mpt_circuit, vec![]).unwrap();
         assert!(prover.verify().is_ok());
@@ -1727,17 +1728,20 @@ mod test_precompiles {
         )
         .unwrap();
 
-        let step = ctx.geth_traces[0]
-            .struct_logs
-            .last()
-            .expect("at least one step");
-        log::debug!("{:?}", step.stack);
-        for (offset, (_, stack_value)) in arg.stack_value.iter().enumerate() {
-            assert_eq!(
-                *stack_value,
-                step.stack.nth_last(offset).expect("stack value not found"),
-                "stack output mismatch"
-            );
+        #[cfg(feature = "enable-stack")]
+        {
+            let step = ctx.geth_traces[0]
+                .struct_logs
+                .last()
+                .expect("at least one step");
+            log::debug!("{:?}", step.stack);
+            for (offset, (_, stack_value)) in arg.stack_value.iter().enumerate() {
+                assert_eq!(
+                    *stack_value,
+                    step.stack.nth_last(offset).expect("stack value not found"),
+                    "stack output mismatch"
+                );
+            }
         }
 
         log::debug!(
@@ -1821,9 +1825,6 @@ mod test_precompiles {
             address: Word::from(0x2),
             stack_value: vec![(
                 Word::from(0x20),
-                #[cfg(feature = "scroll")]
-                Word::zero(),
-                #[cfg(not(feature = "scroll"))]
                 word!("a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89"),
             )],
             ..Default::default()

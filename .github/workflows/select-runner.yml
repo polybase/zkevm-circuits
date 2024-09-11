@@ -38,7 +38,7 @@ jobs:
     outputs:
       matrix1: ${{ toJSON( fromJSON(inputs.matrices)[1] ) }}
       matrix2: ${{ toJSON( fromJSON(inputs.matrices)[2] ) }}
-
+      
   wakeup:
     name: Wake up self-hosted runner
     if: ${{ inputs.enabled }}

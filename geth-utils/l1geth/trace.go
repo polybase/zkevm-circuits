@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/big"
 
@@ -9,22 +10,32 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/eth/tracers/logger"
+	_ "github.com/ethereum/go-ethereum/eth/tracers/native"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 	"github.com/imdario/mergo"
 )
+
+func init() {
+	tracers.DefaultDirectory.Register("structLogTracer", newStructLogTracer, false)
+}
 
 // Copied from github.com/ethereum/go-ethereum/internal/ethapi.ExecutionResult
 // ExecutionResult groups all structured logs emitted by the EVM
 // while replaying a transaction in debug mode as well as transaction
 // execution status, the amount of gas used and the return value
 type ExecutionResult struct {
-	Gas         uint64         `json:"gas"`
-	Failed      bool           `json:"failed"`
-	ReturnValue string         `json:"returnValue"`
-	StructLogs  []StructLogRes `json:"structLogs"`
+	Gas         uint64          `json:"gas"`
+	Failed      bool            `json:"failed"`
+	ReturnValue string          `json:"returnValue"`
+	StructLogs  []StructLogRes  `json:"structLogs"`
+	Prestate    json.RawMessage `json:"prestate"`
+	CallTrace   json.RawMessage `json:"callTrace"`
 }
 
 // StructLogRes stores a structured log emitted by the EVM while replaying a
@@ -109,15 +120,17 @@ type Transaction struct {
 	GasTipCap  *hexutil.Big    `json:"gas_tip_cap"`
 	CallData   hexutil.Bytes   `json:"call_data"`
 	AccessList []struct {
-		Address     common.Address `json:"address"`
-		StorageKeys []common.Hash  `json:"storage_keys"`
+		Address common.Address `json:"address"`
+		// Must be `storageKeys`, since `camelCase` is specified in ethers-rs.
+		// <https://github.com/gakonst/ethers-rs/blob/88095ba47eb6a3507f0db1767353b387b27a6e98/ethers-core/src/types/transaction/eip2930.rs#L75>
+		StorageKeys []common.Hash `json:"storageKeys"`
 	} `json:"access_list"`
 }
 
 type TraceConfig struct {
 	ChainID uint64 `json:"chain_id"`
 	// HistoryHashes contains most recent 256 block hashes in history,
-	// where the lastest one is at HistoryHashes[len(HistoryHashes)-1].
+	// where the latest one is at HistoryHashes[len(HistoryHashes)-1].
 	HistoryHashes []*hexutil.Big             `json:"history_hashes"`
 	Block         Block                      `json:"block_constants"`
 	Accounts      map[common.Address]Account `json:"accounts"`
@@ -137,21 +150,24 @@ func toBigInt(value *hexutil.Big) *big.Int {
 
 func Trace(config TraceConfig) ([]*ExecutionResult, error) {
 	chainConfig := params.ChainConfig{
-		ChainID:             new(big.Int).SetUint64(config.ChainID),
-		HomesteadBlock:      big.NewInt(0),
-		DAOForkBlock:        big.NewInt(0),
-		DAOForkSupport:      true,
-		EIP150Block:         big.NewInt(0),
-		EIP150Hash:          common.Hash{},
-		EIP155Block:         big.NewInt(0),
-		EIP158Block:         big.NewInt(0),
-		ByzantiumBlock:      big.NewInt(0),
-		ConstantinopleBlock: big.NewInt(0),
-		PetersburgBlock:     big.NewInt(0),
-		IstanbulBlock:       big.NewInt(0),
-		MuirGlacierBlock:    big.NewInt(0),
-		BerlinBlock:         big.NewInt(0),
-		LondonBlock:         big.NewInt(0),
+		ChainID:                       new(big.Int).SetUint64(config.ChainID),
+		HomesteadBlock:                big.NewInt(0),
+		DAOForkBlock:                  big.NewInt(0),
+		DAOForkSupport:                true,
+		EIP150Block:                   big.NewInt(0),
+		EIP155Block:                   big.NewInt(0),
+		EIP158Block:                   big.NewInt(0),
+		ByzantiumBlock:                big.NewInt(0),
+		ConstantinopleBlock:           big.NewInt(0),
+		PetersburgBlock:               big.NewInt(0),
+		IstanbulBlock:                 big.NewInt(0),
+		MuirGlacierBlock:              big.NewInt(0),
+		BerlinBlock:                   big.NewInt(0),
+		LondonBlock:                   big.NewInt(0),
+		ShanghaiTime:                  newUint64(0),
+		CancunTime:                    newUint64(0),
+		TerminalTotalDifficulty:       big.NewInt(0),
+		TerminalTotalDifficultyPassed: true,
 	}
 
 	if config.ChainConfig != nil {
@@ -165,10 +181,14 @@ func Trace(config TraceConfig) ([]*ExecutionResult, error) {
 	blockGasLimit := toBigInt(config.Block.GasLimit).Uint64()
 	messages := make([]core.Message, len(config.Transactions))
 	for i, tx := range config.Transactions {
-		// If gas price is specified directly, the tx is treated as legacy type.
 		if tx.GasPrice != nil {
-			tx.GasFeeCap = tx.GasPrice
-			tx.GasTipCap = tx.GasPrice
+			// Set GasFeeCap and GasTipCap to GasPrice if not exist.
+			if tx.GasFeeCap == nil {
+				tx.GasFeeCap = tx.GasPrice
+			}
+			if tx.GasTipCap == nil {
+				tx.GasTipCap = tx.GasPrice
+			}
 		}
 
 		txAccessList := make(types.AccessList, len(tx.AccessList))
@@ -225,7 +245,7 @@ func Trace(config TraceConfig) ([]*ExecutionResult, error) {
 		stateDB.SetNonce(address, uint64(account.Nonce))
 		stateDB.SetCode(address, account.Code)
 		if account.Balance != nil {
-			stateDB.SetBalance(address, toBigInt(account.Balance))
+			stateDB.SetBalance(address, uint256.MustFromBig(toBigInt(account.Balance)), tracing.BalanceChangeUnspecified)
 		}
 		for key, value := range account.Storage {
 			stateDB.SetState(address, key, value)
@@ -233,25 +253,145 @@ func Trace(config TraceConfig) ([]*ExecutionResult, error) {
 	}
 	stateDB.Finalise(true)
 
+	var (
+		usedGas         uint64
+		resultMap       map[string]json.RawMessage
+		executionResult ExecutionResult
+	)
+
+	loggerConfig, err := json.Marshal(config.LoggerConfig)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to marshal configLoggerConfig, %w", err)
+	}
+
 	// Run the transactions with tracing enabled.
 	executionResults := make([]*ExecutionResult, len(config.Transactions))
 	for i, message := range messages {
-		tracer := logger.NewStructLogger(config.LoggerConfig)
-		evm := vm.NewEVM(blockCtx, core.NewEVMTxContext(&message), stateDB, &chainConfig, vm.Config{Debug: true, Tracer: tracer, NoBaseFee: true})
+		txContext := core.NewEVMTxContext(&message)
+		muxTracerConfig := []byte(fmt.Sprintf(`
+		{
+			"structLogTracer": %s,
+			"callTracer": null,
+			"prestateTracer": null
+		}
+		`, loggerConfig))
+		muxTracer, err := tracers.DefaultDirectory.New("muxTracer", new(tracers.Context), muxTracerConfig)
+		if err != nil {
+			return nil, err
+		}
+		evm := vm.NewEVM(blockCtx, txContext, stateDB, &chainConfig, vm.Config{Tracer: muxTracer.Hooks, NoBaseFee: true})
 
-		result, err := core.ApplyMessage(evm, &message, new(core.GasPool).AddGas(message.GasLimit))
+		tx := types.NewTx(toTxData(message, chainConfig.ChainID))
+		_, err = core.ApplyTransactionWithEVM(&message, &chainConfig,
+			new(core.GasPool).AddGas(message.GasLimit), stateDB,
+			blockCtx.BlockNumber,
+			common.Hash{}, tx, &usedGas, evm)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to apply config.Transactions[%d]: %w", i, err)
 		}
 		stateDB.Finalise(true)
 
-		executionResults[i] = &ExecutionResult{
-			Gas:         result.UsedGas,
-			Failed:      result.Failed(),
-			ReturnValue: fmt.Sprintf("%x", result.ReturnData),
-			StructLogs:  FormatLogs(tracer.StructLogs()),
+		muxResult, err := muxTracer.GetResult()
+		if err != nil {
+			return nil, err
 		}
+		if err := json.Unmarshal(muxResult, &resultMap); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(resultMap["structLogTracer"], &executionResult); err != nil {
+			return nil, err
+		}
+		executionResult.Prestate = resultMap["prestateTracer"]
+		executionResult.CallTrace = resultMap["callTracer"]
+
+		executionResults[i] = &executionResult
 	}
 
 	return executionResults, nil
+}
+
+func toTxData(message core.Message, ChainID *big.Int) types.TxData {
+	var data types.TxData
+	switch {
+	case message.BlobHashes != nil:
+		al := types.AccessList{}
+		if message.AccessList != nil {
+			al = message.AccessList
+		}
+		data = &types.BlobTx{
+			To:         *message.To,
+			ChainID:    uint256.MustFromBig((*big.Int)(ChainID)),
+			Nonce:      message.Nonce,
+			Gas:        message.GasLimit,
+			GasFeeCap:  uint256.MustFromBig((*big.Int)(message.GasFeeCap)),
+			GasTipCap:  uint256.MustFromBig((*big.Int)(message.GasTipCap)),
+			Value:      uint256.MustFromBig((*big.Int)(message.Value)),
+			Data:       message.Data,
+			AccessList: al,
+			BlobHashes: message.BlobHashes,
+			BlobFeeCap: uint256.MustFromBig((*big.Int)(message.BlobGasFeeCap)),
+		}
+		// if message.Blobs != nil {
+		// 	data.(*types.BlobTx).Sidecar = &types.BlobTxSidecar{
+		// 		Blobs:       message.Blobs,
+		// 		Commitments: message.Commitments,
+		// 		Proofs:      message.Proofs,
+		// 	}
+		// }
+
+	case message.GasFeeCap != nil:
+		al := types.AccessList{}
+		if message.AccessList != nil {
+			al = message.AccessList
+		}
+		data = &types.DynamicFeeTx{
+			To:         message.To,
+			ChainID:    (*big.Int)(ChainID),
+			Nonce:      message.Nonce,
+			Gas:        message.GasLimit,
+			GasFeeCap:  message.GasFeeCap,
+			GasTipCap:  message.GasTipCap,
+			Value:      message.Value,
+			Data:       message.Data,
+			AccessList: al,
+		}
+
+	case message.AccessList != nil:
+		data = &types.AccessListTx{
+			To:         message.To,
+			ChainID:    ChainID,
+			Nonce:      message.Nonce,
+			Gas:        message.GasLimit,
+			GasPrice:   message.GasPrice,
+			Value:      message.Value,
+			Data:       message.Data,
+			AccessList: message.AccessList,
+		}
+
+	default:
+		data = &types.LegacyTx{
+			To:       message.To,
+			Nonce:    message.Nonce,
+			Gas:      message.GasLimit,
+			GasPrice: message.GasPrice,
+			Value:    message.Value,
+			Data:     message.Data,
+		}
+	}
+	return data
+}
+
+func newStructLogTracer(ctx *tracers.Context, cfg json.RawMessage) (*tracers.Tracer, error) {
+	var config logger.Config
+	if cfg != nil {
+		if err := json.Unmarshal(cfg, &config); err != nil {
+			return nil, err
+		}
+	}
+	structLogger := logger.NewStructLogger(&config)
+	return &tracers.Tracer{
+		Hooks:     structLogger.Hooks(),
+		GetResult: structLogger.GetResult,
+		Stop:      structLogger.Stop,
+	}, nil
 }

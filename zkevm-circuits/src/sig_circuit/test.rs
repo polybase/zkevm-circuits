@@ -1,12 +1,9 @@
-use eth_types::{
-    sign_types::{sign, SignData},
-    Field,
-};
+use crate::{sig_circuit::SigCircuit, util::Field};
+use eth_types::sign_types::{sign, SignData};
 use halo2_proofs::{
     arithmetic::Field as HaloField,
     dev::MockProver,
     halo2curves::{
-        bn256::Fr,
         group::Curve,
         secp256k1::{self, Secp256k1Affine},
     },
@@ -14,16 +11,14 @@ use halo2_proofs::{
 use rand::{Rng, RngCore};
 use std::marker::PhantomData;
 
-use crate::sig_circuit::SigCircuit;
-
 #[test]
 fn test_edge_cases() {
     use super::utils::LOG_TOTAL_NUM_ROWS;
     use eth_types::{
-        sign_types::{biguint_to_32bytes_le, recover_pk, SECP256K1_Q},
+        sign_types::{biguint_to_32bytes_le, recover_pk2, SECP256K1_Q},
         word, ToBigEndian, ToLittleEndian, Word,
     };
-    use halo2_proofs::halo2curves::{group::ff::PrimeField, secp256k1::Fq};
+    use halo2_proofs::halo2curves::{bn256::Fr, group::ff::PrimeField, secp256k1::Fq};
     use num::{BigUint, Integer};
     use rand::SeedableRng;
     use rand_xorshift::XorShiftRng;
@@ -116,12 +111,26 @@ fn test_edge_cases() {
             word!("0x6b0c5c6fb456b976d50eb155a6a15c9e9e93c4afa99d4cad4d86f4ba0cc175fd"),
             1u8,
         ),
+        // 10. special case: u1.G + u2.PK == point at infinity
+        //
+        // where m * s^{-1} (mod n) and r * s^{-1} (mod n)
+        // i.e. m == -r (mod n)
+        {
+            let m = BigUint::from_bytes_le(&secp256k1::Fq::random(&mut rng).to_bytes());
+            let r = &*SECP256K1_Q - m.clone();
+            (
+                Word::from_little_endian(&biguint_to_32bytes_le(m)),
+                Word::from_little_endian(&biguint_to_32bytes_le(r)),
+                Word::from_little_endian(&secp256k1::Fq::random(&mut rng).to_bytes()),
+                0,
+            )
+        },
     ];
     let signatures = ecrecover_data
         .iter()
         .map(|&(msg_hash, r, s, v)| SignData {
             signature: to_sig((r, s, v)),
-            pk: recover_pk(v, &r, &s, &msg_hash.to_be_bytes())
+            pk: recover_pk2(v, &r, &s, &msg_hash.to_be_bytes())
                 .unwrap_or(Secp256k1Affine::identity()),
             msg_hash: {
                 let msg_hash = BigUint::from_bytes_be(&msg_hash.to_be_bytes());
@@ -135,13 +144,14 @@ fn test_edge_cases() {
     log::debug!("signatures=");
     log::debug!("{:#?}", signatures);
 
-    run::<Fr>(LOG_TOTAL_NUM_ROWS as u32, 9, signatures);
+    run::<Fr>(LOG_TOTAL_NUM_ROWS as u32, 10, signatures);
 }
 
 #[test]
 fn sign_verify() {
     use super::utils::LOG_TOTAL_NUM_ROWS;
     use crate::sig_circuit::utils::MAX_NUM_SIG;
+    use halo2_proofs::halo2curves::bn256::Fr;
     use rand::SeedableRng;
     use rand_xorshift::XorShiftRng;
     use sha3::{Digest, Keccak256};
@@ -255,7 +265,7 @@ fn sign_with_rng(
 
 fn run<F: Field>(k: u32, max_verif: usize, signatures: Vec<SignData>) {
     // SignVerifyChip -> ECDSAChip -> MainGate instance column
-    let circuit = SigCircuit::<Fr> {
+    let circuit = SigCircuit::<F> {
         max_verif,
         signatures,
         _marker: PhantomData,

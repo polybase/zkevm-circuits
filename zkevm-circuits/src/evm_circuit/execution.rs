@@ -3,7 +3,7 @@ use super::{
         BLOCK_TABLE_LOOKUPS, BYTECODE_TABLE_LOOKUPS, COPY_TABLE_LOOKUPS, ECC_TABLE_LOOKUPS,
         EXP_TABLE_LOOKUPS, FIXED_TABLE_LOOKUPS, KECCAK_TABLE_LOOKUPS, MODEXP_TABLE_LOOKUPS,
         N_BYTE_LOOKUPS, N_COPY_COLUMNS, N_PHASE1_COLUMNS, POW_OF_RAND_TABLE_LOOKUPS,
-        RW_TABLE_LOOKUPS, SIG_TABLE_LOOKUPS, TX_TABLE_LOOKUPS,
+        RW_TABLE_LOOKUPS, SHA256_TABLE_LOOKUPS, SIG_TABLE_LOOKUPS, TX_TABLE_LOOKUPS,
     },
     util::{instrumentation::Instrument, CachedRegion, CellManager, Inverter, StoredExpression},
     EvmCircuitExports,
@@ -22,13 +22,12 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::{LookupTable, RwTableTag, TxReceiptFieldTag},
-    util::{query_expression, Challenges, Expr},
+    util::{query_expression, Challenges, Expr, Field},
 };
 use bus_mapping::util::read_env_var;
-use eth_types::{Field, ToLittleEndian};
+use eth_types::ToLittleEndian;
 use gadgets::util::not;
 use halo2_proofs::{
-    arithmetic::FieldExt,
     circuit::{Layouter, Region, Value},
     plonk::{
         Advice, Assigned, Column, ConstraintSystem, Error, Expression, FirstPhase, Fixed, Selector,
@@ -36,9 +35,11 @@ use halo2_proofs::{
     },
     poly::Rotation,
 };
+use itertools::Itertools;
 use std::{
     collections::{BTreeSet, HashMap},
     iter,
+    sync::LazyLock,
 };
 
 #[cfg(feature = "onephase")]
@@ -51,10 +52,8 @@ use halo2_proofs::plonk::SecondPhase;
 use halo2_proofs::plonk::ThirdPhase;
 
 use strum::{EnumCount, IntoEnumIterator};
-
-use once_cell::sync::Lazy;
-pub(crate) static CHECK_RW_LOOKUP: Lazy<bool> =
-    Lazy::new(|| read_env_var("CHECK_RW_LOOKUP", false));
+pub(crate) static CHECK_RW_LOOKUP: LazyLock<bool> =
+    LazyLock::new(|| read_env_var("CHECK_RW_LOOKUP", false));
 
 mod add_sub;
 mod addmod;
@@ -113,6 +112,7 @@ mod jump;
 mod jumpdest;
 mod jumpi;
 mod logs;
+mod mcopy;
 mod memory;
 mod msize;
 mod mul_div_mod;
@@ -120,6 +120,7 @@ mod mulmod;
 #[path = "execution/not.rs"]
 mod opcode_not;
 mod origin;
+mod padding;
 mod pc;
 mod pop;
 mod precompiles;
@@ -138,14 +139,17 @@ mod sload;
 mod sstore;
 mod stop;
 mod swap;
+mod tload;
+mod tstore;
 
-use self::{logs::LogGadget, precompiles::BasePrecompileGadget, sha3::Sha3Gadget};
 use add_sub::AddSubGadget;
 use addmod::AddModGadget;
 use address::AddressGadget;
 use balance::BalanceGadget;
 use begin_tx::BeginTxGadget;
 use bitwise::BitwiseGadget;
+#[cfg(feature = "scroll")]
+use block_ctx::DifficultyGadget;
 use block_ctx::{BlockCtxU160Gadget, BlockCtxU256Gadget, BlockCtxU64Gadget};
 use blockhash::BlockHashGadget;
 use byte::ByteGadget;
@@ -178,6 +182,7 @@ use error_oog_dynamic_memory::ErrorOOGDynamicMemoryGadget;
 use error_oog_exp::ErrorOOGExpGadget;
 use error_oog_log::ErrorOOGLogGadget;
 use error_oog_memory_copy::ErrorOOGMemoryCopyGadget;
+use error_oog_precompile::ErrorOOGPrecompileGadget;
 use error_oog_sha3::ErrorOOGSha3Gadget;
 use error_oog_sload_sstore::ErrorOOGSloadSstoreGadget;
 use error_oog_static_memory::ErrorOOGStaticMemoryGadget;
@@ -195,18 +200,20 @@ use is_zero::IsZeroGadget;
 use jump::JumpGadget;
 use jumpdest::JumpdestGadget;
 use jumpi::JumpiGadget;
-
-use crate::evm_circuit::execution::error_oog_precompile::ErrorOOGPrecompileGadget;
+use logs::LogGadget;
+use mcopy::MCopyGadget;
 use memory::MemoryGadget;
 use msize::MsizeGadget;
 use mul_div_mod::MulDivModGadget;
 use mulmod::MulModGadget;
 use opcode_not::NotGadget;
 use origin::OriginGadget;
+use padding::PaddingGadget;
 use pc::PcGadget;
 use pop::PopGadget;
 use precompiles::{
-    EcAddGadget, EcMulGadget, EcPairingGadget, EcrecoverGadget, IdentityGadget, ModExpGadget,
+    BasePrecompileGadget, EcAddGadget, EcMulGadget, EcPairingGadget, EcrecoverGadget,
+    IdentityGadget, ModExpGadget, SHA256Gadget,
 };
 use push::PushGadget;
 use return_revert::ReturnRevertGadget;
@@ -215,6 +222,7 @@ use returndatasize::ReturnDataSizeGadget;
 use sar::SarGadget;
 use sdiv_smod::SignedDivModGadget;
 use selfbalance::SelfbalanceGadget;
+use sha3::Sha3Gadget;
 use shl_shr::ShlShrGadget;
 use signed_comparator::SignedComparatorGadget;
 use signextend::SignextendGadget;
@@ -222,8 +230,10 @@ use sload::SloadGadget;
 use sstore::SstoreGadget;
 use stop::StopGadget;
 use swap::SwapGadget;
+use tload::TloadGadget;
+use tstore::TstoreGadget;
 
-pub(crate) trait ExecutionGadget<F: FieldExt> {
+pub(crate) trait ExecutionGadget<F: Field> {
     const NAME: &'static str;
 
     const EXECUTION_STATE: ExecutionState;
@@ -234,7 +244,7 @@ pub(crate) trait ExecutionGadget<F: FieldExt> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         transaction: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -246,7 +256,7 @@ pub(crate) struct ExecutionConfig<F> {
     // EVM Circuit selector, which enables all usable rows.  The rows where this selector is
     // disabled won't verify any constraint (they can be unused rows or rows with blinding
     // factors).
-    q_usable: Selector,
+    q_usable: Column<Fixed>,
     // Dynamic selector that is enabled at the rows where each assigned execution step starts (a
     // step has dynamic height).
     q_step: Column<Advice>,
@@ -266,6 +276,7 @@ pub(crate) struct ExecutionConfig<F> {
     // internal state gadgets
     begin_tx_gadget: Box<BeginTxGadget<F>>,
     end_block_gadget: Box<EndBlockGadget<F>>,
+    padding_gadget: Box<PaddingGadget<F>>,
     end_inner_block_gadget: Box<EndInnerBlockGadget<F>>,
     end_tx_gadget: Box<EndTxGadget<F>>,
     // opcode gadgets
@@ -298,6 +309,7 @@ pub(crate) struct ExecutionConfig<F> {
     jumpi_gadget: Box<JumpiGadget<F>>,
     log_gadget: Box<LogGadget<F>>,
     memory_gadget: Box<MemoryGadget<F>>,
+    mcopy_gadget: Box<MCopyGadget<F>>,
     msize_gadget: Box<MsizeGadget<F>>,
     mul_div_mod_gadget: Box<MulDivModGadget<F>>,
     mulmod_gadget: Box<MulModGadget<F>>,
@@ -322,12 +334,16 @@ pub(crate) struct ExecutionConfig<F> {
     signextend_gadget: Box<SignextendGadget<F>>,
     sload_gadget: Box<SloadGadget<F>>,
     sstore_gadget: Box<SstoreGadget<F>>,
+    tload_gadget: Box<TloadGadget<F>>,
+    tstore_gadget: Box<TstoreGadget<F>>,
     stop_gadget: Box<StopGadget<F>>,
     swap_gadget: Box<SwapGadget<F>>,
     blockhash_gadget: Box<BlockHashGadget<F>>,
     block_ctx_u64_gadget: Box<BlockCtxU64Gadget<F>>,
     block_ctx_u160_gadget: Box<BlockCtxU160Gadget<F>>,
     block_ctx_u256_gadget: Box<BlockCtxU256Gadget<F>>,
+    #[cfg(feature = "scroll")]
+    difficulty_gadget: Box<DifficultyGadget<F>>,
     // error gadgets
     error_oog_call: Box<ErrorOOGCallGadget<F>>,
     error_oog_precompile: Box<ErrorOOGPrecompileGadget<F>>,
@@ -354,7 +370,7 @@ pub(crate) struct ExecutionConfig<F> {
     error_return_data_out_of_bound: Box<ErrorReturnDataOutOfBoundGadget<F>>,
     // precompile calls
     precompile_ecrecover_gadget: Box<EcrecoverGadget<F>>,
-    precompile_sha2_gadget: Box<BasePrecompileGadget<F, { ExecutionState::PrecompileSha256 }>>,
+    precompile_sha2_gadget: Box<SHA256Gadget<F>>,
     precompile_ripemd_gadget: Box<BasePrecompileGadget<F, { ExecutionState::PrecompileRipemd160 }>>,
     precompile_identity_gadget: Box<IdentityGadget<F>>,
     precompile_modexp_gadget: Box<ModExpGadget<F>>,
@@ -375,9 +391,11 @@ impl<F: Field> ExecutionConfig<F> {
         tx_table: &dyn LookupTable<F>,
         rw_table: &dyn LookupTable<F>,
         bytecode_table: &dyn LookupTable<F>,
+        #[cfg(feature = "dual-bytecode")] bytecode_table1: &dyn LookupTable<F>,
         block_table: &dyn LookupTable<F>,
         copy_table: &dyn LookupTable<F>,
         keccak_table: &dyn LookupTable<F>,
+        sha256_table: &dyn LookupTable<F>,
         exp_table: &dyn LookupTable<F>,
         sig_table: &dyn LookupTable<F>,
         modexp_table: &dyn LookupTable<F>,
@@ -385,7 +403,7 @@ impl<F: Field> ExecutionConfig<F> {
         pow_of_rand_table: &dyn LookupTable<F>,
     ) -> Self {
         let mut instrument = Instrument::default();
-        let q_usable = meta.complex_selector();
+        let q_usable = meta.fixed_column();
         let q_step = meta.advice_column();
         let constants = meta.fixed_column();
         meta.enable_constant(constants);
@@ -414,7 +432,7 @@ impl<F: Field> ExecutionConfig<F> {
         let mut height_map = HashMap::new();
 
         meta.create_gate("Constrain execution state", |meta| {
-            let q_usable = meta.query_selector(q_usable);
+            let q_usable = meta.query_fixed(q_usable, Rotation::cur());
             let q_step = meta.query_advice(q_step, Rotation::cur());
             let q_step_first = meta.query_selector(q_step_first);
             let q_step_last = meta.query_selector(q_step_last);
@@ -423,11 +441,11 @@ impl<F: Field> ExecutionConfig<F> {
 
             // NEW: Enabled, this will break hand crafted tests, maybe we can remove them?
             let first_step_check = {
-                let begin_tx_end_block_selector = step_curr
-                    .execution_state_selector([ExecutionState::BeginTx, ExecutionState::EndBlock]);
+                let begin_tx_or_padding_selector = step_curr
+                    .execution_state_selector([ExecutionState::BeginTx, ExecutionState::Padding]);
                 iter::once((
-                    "First step should be BeginTx or EndBlock",
-                    q_step_first * (1.expr() - begin_tx_end_block_selector),
+                    "First step should be BeginTx or Padding",
+                    q_step_first * (1.expr() - begin_tx_or_padding_selector),
                 ))
             };
 
@@ -446,20 +464,14 @@ impl<F: Field> ExecutionConfig<F> {
                 .chain(first_step_check)
                 .chain(last_step_check)
         });
-
-        meta.create_gate("q_step", |meta| {
-            let q_usable = meta.query_selector(q_usable);
+        meta.create_gate("q_step_first", |meta| {
+            let q_usable = meta.query_fixed(q_usable, Rotation::cur());
             let q_step_first = meta.query_selector(q_step_first);
-            let q_step_last = meta.query_selector(q_step_last);
             let q_step = meta.query_advice(q_step, Rotation::cur());
-            let num_rows_left_cur = meta.query_advice(num_rows_until_next_step, Rotation::cur());
-            let num_rows_left_next = meta.query_advice(num_rows_until_next_step, Rotation::next());
-            let num_rows_left_inverse = meta.query_advice(num_rows_inv, Rotation::cur());
-
             let mut cb = BaseConstraintBuilder::default();
             // q_step needs to be enabled on the first row
             // rw_counter starts at 1
-            cb.condition(q_step_first, |cb| {
+            cb.condition(q_usable, |cb| {
                 cb.require_equal("q_step == 1", q_step.clone(), 1.expr());
                 cb.require_equal(
                     "rw_counter is initialized to be 1",
@@ -467,6 +479,27 @@ impl<F: Field> ExecutionConfig<F> {
                     1.expr(),
                 )
             });
+            cb.gate(q_step_first)
+        });
+        meta.create_gate("q_step_last", |meta| {
+            let q_usable = meta.query_fixed(q_usable, Rotation::cur());
+            let q_step_last = meta.query_selector(q_step_last);
+            let q_step = meta.query_advice(q_step, Rotation::cur());
+            let mut cb = BaseConstraintBuilder::default();
+            // q_step needs to be enabled on the last row
+            cb.condition(q_usable, |cb| {
+                cb.require_equal("q_step == 1", q_step.clone(), 1.expr());
+            });
+            cb.gate(q_step_last)
+        });
+        meta.create_gate("q_step", |meta| {
+            let q_usable = meta.query_fixed(q_usable, Rotation::cur());
+            let q_step = meta.query_advice(q_step, Rotation::cur());
+            let num_rows_left_cur = meta.query_advice(num_rows_until_next_step, Rotation::cur());
+            let num_rows_left_next = meta.query_advice(num_rows_until_next_step, Rotation::next());
+            let num_rows_left_inverse = meta.query_advice(num_rows_inv, Rotation::cur());
+
+            let mut cb = BaseConstraintBuilder::default();
             // For every step, is_create and is_root are boolean.
             cb.condition(q_step.clone(), |cb| {
                 cb.require_boolean(
@@ -475,12 +508,8 @@ impl<F: Field> ExecutionConfig<F> {
                 );
                 cb.require_boolean("step.is_root is boolean", step_curr.state.is_root.expr());
             });
-            // q_step needs to be enabled on the last row
-            cb.condition(q_step_last, |cb| {
-                cb.require_equal("q_step == 1", q_step.clone(), 1.expr());
-            });
             // Except when step is enabled, the step counter needs to decrease by 1
-            cb.condition(1.expr() - q_step.clone(), |cb| {
+            cb.condition(not::expr(q_step.clone()), |cb| {
                 cb.require_equal(
                     "num_rows_left_cur := num_rows_left_next + 1",
                     num_rows_left_cur.clone(),
@@ -510,7 +539,7 @@ impl<F: Field> ExecutionConfig<F> {
                 // the gadget value before being copied to the box is freed immediately after
                 // the boxed gadget is returned.
                 // We put each gadget in a box so that they stay in the heap to keep
-                // ExecutionConfig at a managable size.
+                // ExecutionConfig at a manageable size.
                 (|| {
                     Box::new(Self::configure_gadget(
                         meta,
@@ -546,6 +575,7 @@ impl<F: Field> ExecutionConfig<F> {
             end_block_gadget: configure_gadget!(),
             end_inner_block_gadget: configure_gadget!(),
             end_tx_gadget: configure_gadget!(),
+            padding_gadget: configure_gadget!(),
             // opcode gadgets
             add_sub_gadget: configure_gadget!(),
             addmod_gadget: configure_gadget!(),
@@ -572,6 +602,7 @@ impl<F: Field> ExecutionConfig<F> {
             jumpi_gadget: configure_gadget!(),
             log_gadget: configure_gadget!(),
             memory_gadget: configure_gadget!(),
+            mcopy_gadget: configure_gadget!(),
             msize_gadget: configure_gadget!(),
             mul_div_mod_gadget: configure_gadget!(),
             mulmod_gadget: configure_gadget!(),
@@ -601,11 +632,15 @@ impl<F: Field> ExecutionConfig<F> {
             signextend_gadget: configure_gadget!(),
             sload_gadget: configure_gadget!(),
             sstore_gadget: configure_gadget!(),
+            tload_gadget: configure_gadget!(),
+            tstore_gadget: configure_gadget!(),
             stop_gadget: configure_gadget!(),
             swap_gadget: configure_gadget!(),
             block_ctx_u64_gadget: configure_gadget!(),
             block_ctx_u160_gadget: configure_gadget!(),
             block_ctx_u256_gadget: configure_gadget!(),
+            #[cfg(feature = "scroll")]
+            difficulty_gadget: configure_gadget!(),
             // error gadgets
             error_oog_constant: configure_gadget!(),
             error_oog_static_memory_gadget: configure_gadget!(),
@@ -653,9 +688,12 @@ impl<F: Field> ExecutionConfig<F> {
             tx_table,
             rw_table,
             bytecode_table,
+            #[cfg(feature = "dual-bytecode")]
+            bytecode_table1,
             block_table,
             copy_table,
             keccak_table,
+            sha256_table,
             exp_table,
             sig_table,
             modexp_table,
@@ -675,7 +713,7 @@ impl<F: Field> ExecutionConfig<F> {
     fn configure_gadget<G: ExecutionGadget<F>>(
         meta: &mut ConstraintSystem<F>,
         advices: [Column<Advice>; STEP_WIDTH],
-        q_usable: Selector,
+        q_usable: Column<Fixed>,
         q_step: Column<Advice>,
         num_rows_until_next_step: Column<Advice>,
         q_step_first: Selector,
@@ -736,7 +774,7 @@ impl<F: Field> ExecutionConfig<F> {
     #[allow(clippy::too_many_arguments)]
     fn configure_gadget_impl(
         meta: &mut ConstraintSystem<F>,
-        q_usable: Selector,
+        q_usable: Column<Fixed>,
         q_step: Column<Advice>,
         num_rows_until_next_step: Column<Advice>,
         q_step_first: Selector,
@@ -796,7 +834,7 @@ impl<F: Field> ExecutionConfig<F> {
         ] {
             if !constraints.is_empty() {
                 meta.create_gate(name, |meta| {
-                    let q_usable = meta.query_selector(q_usable);
+                    let q_usable = meta.query_fixed(q_usable, Rotation::cur());
                     let selector = selector(meta);
                     constraints.into_iter().map(move |(name, constraint)| {
                         (
@@ -813,7 +851,7 @@ impl<F: Field> ExecutionConfig<F> {
 
         // Enforce the state transitions for this opcode
         meta.create_gate("Constrain state machine transitions", |meta| {
-            let q_usable = meta.query_selector(q_usable);
+            let q_usable = meta.query_fixed(q_usable, Rotation::cur());
             let q_step = meta.query_advice(q_step, Rotation::cur());
             let q_step_last = meta.query_selector(q_step_last);
 
@@ -827,14 +865,14 @@ impl<F: Field> ExecutionConfig<F> {
                             vec![ExecutionState::BeginTx, ExecutionState::EndInnerBlock],
                         ),
                         (
-                            "EndInnerBlock can only transition to BeginTx, EndInnerBlock or EndBlock",
+                            "EndInnerBlock can only transition to BeginTx, EndInnerBlock or Padding",
                             ExecutionState::EndInnerBlock,
-                            vec![ExecutionState::BeginTx, ExecutionState::EndInnerBlock, ExecutionState::EndBlock],
+                            vec![ExecutionState::BeginTx, ExecutionState::EndInnerBlock, ExecutionState::Padding],
                         ),
                         (
-                            "EndBlock can only transit to EndBlock",
-                            ExecutionState::EndBlock,
-                            vec![ExecutionState::EndBlock],
+                            "Padding can only transit to Padding or EndBlock",
+                            ExecutionState::Padding,
+                            vec![ExecutionState::Padding, ExecutionState::EndBlock],
                         ),
                     ])
                     .filter(move |(_, from, _)| *from == execution_state)
@@ -848,19 +886,21 @@ impl<F: Field> ExecutionConfig<F> {
                             vec![ExecutionState::EndTx, ExecutionState::EndInnerBlock],
                         ),
                         (
-                            "Only ExecutionState which halts or BeginTx can transit to EndTx",
+                            "Only ExecutionState which halts / precompile or BeginTx can transit to EndTx",
                             ExecutionState::EndTx,
                             ExecutionState::iter()
                                 .filter(ExecutionState::halts)
+                                .chain(ExecutionState::iter().filter(ExecutionState::is_precompiled))
                                 .chain(iter::once(ExecutionState::BeginTx))
                                 .collect(),
                         ),
                         (
-                            "Only EndInnerBlock or EndBlock can transit to EndBlock",
+                            "Only Padding can transit to EndBlock",
                             ExecutionState::EndBlock,
-                            vec![ExecutionState::EndInnerBlock, ExecutionState::EndBlock],
+                            vec![ExecutionState::Padding],
                         ),
                         (
+                            // Empty block can result multiple EndInnerBlock states.
                             "Only EndTx or EndInnerBlock can transit to EndInnerBlock",
                             ExecutionState::EndInnerBlock,
                             vec![ExecutionState::EndTx, ExecutionState::EndInnerBlock],
@@ -878,9 +918,9 @@ impl<F: Field> ExecutionConfig<F> {
                             step_next.state.block_number.expr() - step_curr.state.block_number.expr() - 1.expr(),
                         ),
                         (
-                            "EndInnerBlock -> EndBlock: block number does not change",
+                            "EndInnerBlock -> Padding: block number does not change",
                             ExecutionState::EndInnerBlock,
-                            vec![ExecutionState::EndBlock],
+                            vec![ExecutionState::Padding],
                             step_next.state.block_number.expr() - step_curr.state.block_number.expr(),
                         ),
                     ])
@@ -919,9 +959,11 @@ impl<F: Field> ExecutionConfig<F> {
         tx_table: &dyn LookupTable<F>,
         rw_table: &dyn LookupTable<F>,
         bytecode_table: &dyn LookupTable<F>,
+        #[cfg(feature = "dual-bytecode")] bytecode_table1: &dyn LookupTable<F>,
         block_table: &dyn LookupTable<F>,
         copy_table: &dyn LookupTable<F>,
         keccak_table: &dyn LookupTable<F>,
+        sha256_table: &dyn LookupTable<F>,
         exp_table: &dyn LookupTable<F>,
         sig_table: &dyn LookupTable<F>,
         modexp_table: &dyn LookupTable<F>,
@@ -939,9 +981,12 @@ impl<F: Field> ExecutionConfig<F> {
                         Table::Tx => tx_table,
                         Table::Rw => rw_table,
                         Table::Bytecode => bytecode_table,
+                        #[cfg(feature = "dual-bytecode")]
+                        Table::Bytecode1 => bytecode_table1,
                         Table::Block => block_table,
                         Table::Copy => copy_table,
                         Table::Keccak => keccak_table,
+                        Table::Sha256 => sha256_table,
                         Table::Exp => exp_table,
                         Table::Sig => sig_table,
                         Table::ModExp => modexp_table,
@@ -966,7 +1011,16 @@ impl<F: Field> ExecutionConfig<F> {
         }
     }
 
-    pub fn get_num_rows_required(&self, block: &Block<F>) -> usize {
+    pub fn get_num_rows_required_no_padding(&self, block: &Block) -> usize {
+        let mut num_rows = 0;
+        for transaction in &block.txs {
+            for step in &transaction.steps {
+                num_rows += step.execution_state.get_step_height();
+            }
+        }
+        num_rows
+    }
+    pub fn get_num_rows_required(&self, block: &Block) -> usize {
         // Start at 1 so we can be sure there is an unused `next` row available
         let mut num_rows = 1;
         let evm_rows = block.circuits_params.max_evm_rows;
@@ -976,7 +1030,7 @@ impl<F: Field> ExecutionConfig<F> {
                     num_rows += step.execution_state.get_step_height();
                 }
             }
-            num_rows += 1; // EndBlock
+            num_rows += 1; // At least 1 Padding needed
         } else {
             num_rows = block.circuits_params.max_evm_rows;
         }
@@ -994,7 +1048,12 @@ impl<F: Field> ExecutionConfig<F> {
         // Name Advice columns
         for idx in 0..height {
             let offset = offset + idx;
-            self.q_usable.enable(region, offset)?;
+            region.assign_fixed(
+                || "q_usable selector",
+                self.q_usable,
+                offset,
+                || Value::known(F::one()),
+            )?;
             region.assign_advice(
                 || "step selector",
                 self.q_step,
@@ -1024,191 +1083,320 @@ impl<F: Field> ExecutionConfig<F> {
     pub fn assign_block(
         &self,
         layouter: &mut impl Layouter<F>,
-        block: &Block<F>,
+        block: &Block,
         challenges: &Challenges<Value<F>>,
     ) -> Result<EvmCircuitExports<Assigned<F>>, Error> {
-        let mut is_first_time = true;
+        // If the height is not 1, padding to fixed height will be impossible
+        debug_assert_eq!(ExecutionState::Padding.get_step_height(), 1);
 
-        layouter.assign_region(
-            || "Execution step",
-            |mut region| {
-                if is_first_time {
-                    is_first_time = false;
-                    region.assign_advice(
-                        || "step selector",
-                        self.q_step,
-                        self.get_num_rows_required(block) - 1,
-                        || Value::known(F::zero()),
-                    )?;
-                    return Ok(());
-                }
-                let mut offset = 0;
+        let inverter = Inverter::new(MAX_STEP_HEIGHT as u64);
+        let evm_rows = block.circuits_params.max_evm_rows;
+        // 0 means "dynamic height". If fixed height is used in unittests, CI will be quite slow.
+        let no_padding = evm_rows == 0;
 
-                let inverter = Inverter::new(MAX_STEP_HEIGHT as u64);
+        // There should be 3 group of regions
+        // 1. real steps
+        // 2. padding. For the ease of implementation, even for `no_padding` case, we will still pad
+        //    1 step.
+        // 3. EndBlock
+        let region1_height = self.get_num_rows_required_no_padding(block);
+        let region3_height = ExecutionState::EndBlock.get_step_height() + 1; // plus a dummy "next" row used for Rotation
+        let region2_height = if no_padding {
+            1
+        } else {
+            if region1_height + region3_height >= evm_rows {
+                log::error!(
+                    "evm circuit row not enough, region1_height:{}, region3_height:{}, max_evm_rows:{}",
+                    region1_height,
+                    region3_height,
+                    evm_rows
+                );
+                return Err(Error::Synthesis);
+            }
+            evm_rows - region3_height - region1_height
+        };
 
-                // Annotate the EVMCircuit columns within it's single region.
-                self.annotate_circuit(&mut region);
+        // A quick path for "reporting" height for the halo2 first pass layouter.
+        let assign_shape_fn = |region: &mut Region<'_, F>, height| {
+            region.assign_advice(
+                || "step selector",
+                self.q_step,
+                height - 1,
+                || Value::known(F::zero()),
+            )?;
+            Ok(height)
+        };
 
-                self.q_step_first.enable(&mut region, offset)?;
+        let dummy_tx = Transaction::default();
+        let last_call = block
+            .txs
+            .last()
+            .map(|tx| tx.calls[0].clone())
+            .unwrap_or_default();
+        let padding_step = &block.padding_step;
+        let end_block_step = &block.end_block_step;
 
-                let dummy_tx = Transaction::default();
-                let last_call = block
-                    .txs
-                    .last()
-                    .map(|tx| tx.calls[0].clone())
-                    .unwrap_or_else(Call::default);
-                let end_block_not_last = &block.end_block_not_last;
-                let end_block_last = &block.end_block_last;
-                // Collect all steps
-                let mut steps = block
-                    .txs
-                    .iter()
-                    .flat_map(|tx| {
-                        tx.steps
-                            .iter()
-                            .map(move |step| (tx, &tx.calls[step.call_index], step))
+        // A helper struct used for parallel assignment
+        struct StepAssignment {
+            tx_idx: usize,
+            step_idx_in_tx: usize,
+            height: usize,
+            offset: usize,
+        }
+        let total_step_num = block.txs.iter().map(|t| t.steps.len()).sum::<usize>();
+        let mut step_assignments: Vec<StepAssignment> = Vec::with_capacity(total_step_num);
+
+        // the "global offset"
+        let mut offset = 0;
+        for (tx_idx, tx) in block.txs.iter().enumerate() {
+            for (step_idx, step) in tx.steps.iter().enumerate() {
+                let height = step.execution_state.get_step_height();
+                step_assignments.push(StepAssignment {
+                    tx_idx,
+                    step_idx_in_tx: step_idx,
+                    offset,
+                    height,
+                });
+                offset += height;
+            }
+        }
+        assert_eq!(offset, region1_height);
+        offset = 0;
+
+        // Print some logs after each tx, for debugging
+        let log_step_fn = |transaction: &Transaction, step: &ExecStep, offset| {
+            if step.execution_state == ExecutionState::EndTx {
+                let mut tx = transaction.clone();
+                tx.call_data.clear();
+                tx.calls.clear();
+                tx.steps.clear();
+                tx.rlp_signed.clear();
+                tx.rlp_unsigned.clear();
+                let total_gas = {
+                    let gas_used = tx.gas - step.gas_left;
+                    let current_cumulative_gas_used: u64 = if tx.id == 1 {
+                        0
+                    } else {
+                        // first transaction needs TxReceiptFieldTag::COUNT(3) lookups
+                        // to tx receipt,
+                        // while later transactions need 4 (with one extra cumulative
+                        // gas read) lookups
+                        let rw = &block.rws[(
+                            RwTableTag::TxReceipt,
+                            (tx.id - 2) * (TxReceiptFieldTag::COUNT + 1) + 2,
+                        )];
+                        rw.receipt_value()
+                    };
+                    current_cumulative_gas_used + gas_used
+                };
+                log::info!(
+                    "offset {} tx_num {} total_gas {} assign last step {:?} of tx {:?}",
+                    offset,
+                    tx.id,
+                    total_gas,
+                    step,
+                    tx
+                );
+            }
+        };
+
+        // Calculate chunk_size and chunk_num
+        // Here a min_chunk_size is provided to reduce threading overhead
+        let chunking_fn = |name: &str, task_len: usize, min_chunk_size: usize| -> (usize, usize) {
+            if task_len == 0 {
+                return (0, 0);
+            }
+            let num_threads = std::thread::available_parallelism()
+                .map(|e| e.get())
+                .unwrap_or(1);
+            //let num_threads = 1;
+            let chunk_size = ((task_len + num_threads - 1) / num_threads).max(min_chunk_size);
+            let chunk_num = (task_len + chunk_size - 1) / chunk_size;
+            log::debug!(
+                "{} chunking: len = {}, num_threads = {}, chunk_size = {}, chunk_num = {}",
+                name,
+                task_len,
+                num_threads,
+                chunk_size,
+                chunk_num
+            );
+            (chunk_size, chunk_num)
+        };
+
+        // Step1: assign real steps
+        let (region1_chunk_size, region1_chunk_num) =
+            chunking_fn("region1", step_assignments.len(), 50);
+        let mut region1_is_first_time: Vec<(usize, bool)> = (0..region1_chunk_num)
+            .map(|chunk_idx| (chunk_idx, true))
+            .collect();
+        let region1_height_sum = layouter
+            .assign_regions(
+                || "Execution step region1",
+                region1_is_first_time
+                    .iter_mut()
+                    .map(|(chunk_idx, is_first_time)| {
+                        |mut region: Region<'_, F>| {
+                            let chunk_idx = *chunk_idx;
+                            let begin = chunk_idx * region1_chunk_size;
+                            let end =
+                                ((chunk_idx + 1) * region1_chunk_size).min(step_assignments.len());
+                            let step_idxs: Vec<usize> = (begin..end).collect();
+                            log::trace!("region1 range {} {} {}", chunk_idx, begin, end);
+                            let total_height = step_idxs
+                                .iter()
+                                .map(|idx| step_assignments[*idx].height)
+                                .sum::<usize>();
+                            if *is_first_time {
+                                *is_first_time = false;
+                                return assign_shape_fn(&mut region, total_height);
+                            }
+                            let mut offset = 0;
+
+                            // Annotate the EVMCircuit columns within it's single region.
+                            self.annotate_circuit(&mut region);
+
+                            if chunk_idx == 0 {
+                                self.q_step_first.enable(&mut region, offset)?;
+                            }
+                            for step_idx in step_idxs {
+                                let step_assignment = &step_assignments[step_idx];
+                                let transaction = &block.txs[step_assignment.tx_idx];
+                                let step = &transaction.steps[step_assignment.step_idx_in_tx];
+                                let call = &transaction.calls[step.call_index];
+
+                                let height = step.execution_state.get_step_height();
+
+                                log_step_fn(transaction, step, offset);
+
+                                let next = match step_assignments.get(step_idx + 1) {
+                                    None => (&dummy_tx, &last_call, padding_step),
+                                    Some(step_assignment) => {
+                                        let transaction = &block.txs[step_assignment.tx_idx];
+                                        let step =
+                                            &transaction.steps[step_assignment.step_idx_in_tx];
+                                        let call = &transaction.calls[step.call_index];
+                                        (transaction, call, step)
+                                    }
+                                };
+
+                                self.assign_exec_step(
+                                    &mut region,
+                                    offset,
+                                    block,
+                                    transaction,
+                                    call,
+                                    step,
+                                    height,
+                                    Some(next),
+                                    challenges,
+                                )?;
+
+                                self.assign_q_step(&mut region, &inverter, offset, height)?;
+
+                                offset += height;
+                            }
+                            debug_assert_eq!(offset, total_height);
+                            Ok(total_height)
+                        }
                     })
-                    .chain(std::iter::once((&dummy_tx, &last_call, end_block_not_last)))
-                    .peekable();
+                    .collect_vec(),
+            )?
+            .into_iter()
+            .sum::<usize>();
 
-                let evm_rows = block.circuits_params.max_evm_rows;
-                let no_padding = evm_rows == 0;
+        debug_assert_eq!(region1_height, region1_height_sum);
 
-                // part1: assign real steps
-                loop {
-                    let (transaction, call, step) = steps.next().expect("should not be empty");
-                    let next = steps.peek();
-                    if next.is_none() {
-                        break;
+        // part2: assign paddings steps when padding needed
+        assert!(region2_height >= 1);
+        let (region2_chunk_size, region2_chunk_num) = chunking_fn("region2", region2_height, 300);
+        let mut region2_is_first_time: Vec<(usize, bool)> = (0..region2_chunk_num)
+            .map(|chunk_idx| (chunk_idx, true))
+            .collect();
+        log::trace!(
+            "assign padding steps in range [{},{})",
+            region1_height,
+            region1_height + region2_height
+        );
+        layouter.assign_regions(
+            || "Execution step region2",
+            region2_is_first_time
+                .iter_mut()
+                .map(|(chunk_idx, is_first_time)| {
+                    |mut region: Region<'_, F>| {
+                        let chunk_idx = *chunk_idx;
+                        let begin = chunk_idx * region2_chunk_size;
+                        let end = ((chunk_idx + 1) * region2_chunk_size).min(region2_height);
+                        let region_height = end - begin;
+                        if *is_first_time {
+                            *is_first_time = false;
+                            return assign_shape_fn(&mut region, region_height);
+                        }
+                        if chunk_idx == 0 && region1_height == 0 {
+                            self.q_step_first.enable(&mut region, 0)?;
+                        }
+                        self.assign_same_exec_step_in_range(
+                            &mut region,
+                            0,
+                            region_height,
+                            block,
+                            &dummy_tx,
+                            &last_call,
+                            padding_step,
+                            1,
+                            challenges,
+                        )?;
+                        for row_idx in 0..region_height {
+                            self.assign_q_step(&mut region, &inverter, row_idx, 1)?;
+                        }
+                        Ok(region_height)
                     }
-                    let height = step.execution_state.get_step_height();
+                })
+                .collect_vec(),
+        )?;
 
-                    // Assign the step witness
-                    if step.execution_state == ExecutionState::EndTx {
-                        let mut tx = transaction.clone();
-                        tx.call_data.clear();
-                        tx.calls.clear();
-                        tx.steps.clear();
-                        tx.rlp_signed.clear();
-                        tx.rlp_unsigned.clear();
-                        let total_gas = {
-                            let gas_used = tx.gas - step.gas_left;
-                            let current_cumulative_gas_used: u64 = if tx.id == 1 {
-                                0
-                            } else {
-                                // first transaction needs TxReceiptFieldTag::COUNT(3) lookups
-                                // to tx receipt,
-                                // while later transactions need 4 (with one extra cumulative
-                                // gas read) lookups
-                                let rw = &block.rws[(
-                                    RwTableTag::TxReceipt,
-                                    (tx.id - 2) * (TxReceiptFieldTag::COUNT + 1) + 2,
-                                )];
-                                rw.receipt_value()
-                            };
-                            current_cumulative_gas_used + gas_used
-                        };
-                        log::info!(
-                            "offset {} tx_num {} total_gas {} assign last step {:?} of tx {:?}",
-                            offset,
-                            tx.id,
-                            total_gas,
-                            step,
-                            tx
-                        );
-                    }
-                    self.assign_exec_step(
-                        &mut region,
-                        offset,
-                        block,
-                        transaction,
-                        call,
-                        step,
-                        height,
-                        next.copied(),
-                        challenges,
-                    )?;
+        // part3: assign the EndBlock at offset `evm_rows - 1`
+        // This region don't need to be parallelized
+        log::trace!(
+            "assign EndBlock at offset {}",
+            region1_height + region2_height
+        );
 
-                    // q_step logic
-                    self.assign_q_step(&mut region, &inverter, offset, height)?;
-
-                    offset += height;
+        let mut region3_is_first_time = true;
+        layouter.assign_region(
+            || "Execution step region3",
+            |mut region| {
+                if region3_is_first_time {
+                    region3_is_first_time = false;
+                    return assign_shape_fn(&mut region, region3_height);
                 }
-
-                // part2: assign non-last EndBlock steps when padding needed
-                if !no_padding {
-                    let height = ExecutionState::EndBlock.get_step_height();
-                    debug_assert_eq!(height, 1);
-                    // 1 for EndBlock(last), 1 for "part 4" cells
-                    let last_row = evm_rows - 2;
-                    log::trace!(
-                        "assign non-last EndBlock in range [{},{})",
-                        offset,
-                        last_row
-                    );
-                    if offset > last_row {
-                        log::error!(
-                            "evm circuit row not enough, offset: {}, max_evm_rows: {}",
-                            offset,
-                            evm_rows
-                        );
-                        return Err(Error::Synthesis);
-                    }
-                    self.assign_same_exec_step_in_range(
-                        &mut region,
-                        offset,
-                        last_row,
-                        block,
-                        &dummy_tx,
-                        &last_call,
-                        end_block_not_last,
-                        height,
-                        challenges,
-                    )?;
-
-                    for row_idx in offset..last_row {
-                        self.assign_q_step(&mut region, &inverter, row_idx, height)?;
-                    }
-                    offset = last_row;
-                }
-
-                // part3: assign the last EndBlock at offset `evm_rows - 1`
-                let height = ExecutionState::EndBlock.get_step_height();
-                debug_assert_eq!(height, 1);
-                log::trace!("assign last EndBlock at offset {}", offset);
+                let height = end_block_step.execution_state.get_step_height();
                 self.assign_exec_step(
                     &mut region,
                     offset,
                     block,
                     &dummy_tx,
                     &last_call,
-                    end_block_last,
+                    end_block_step,
                     height,
                     None,
                     challenges,
                 )?;
                 self.assign_q_step(&mut region, &inverter, offset, height)?;
-                // enable q_step_last
                 self.q_step_last.enable(&mut region, offset)?;
-                offset += height;
-
-                // part4:
                 // These are still referenced (but not used) in next rows
                 region.assign_advice(
                     || "step height",
                     self.num_rows_until_next_step,
-                    offset,
+                    height,
                     || Value::known(F::zero()),
                 )?;
                 region.assign_advice(
                     || "step height inv",
                     self.q_step,
-                    offset,
+                    height,
                     || Value::known(F::zero()),
                 )?;
-
-                log::debug!("assign for region done at offset {}", offset);
-                Ok(())
+                Ok(height + 1) // region height
             },
         )?;
 
@@ -1217,14 +1405,9 @@ impl<F: Field> ExecutionConfig<F> {
         let final_withdraw_root_cell = self
             .end_block_gadget
             .withdraw_root_assigned
-            .borrow()
+            .lock()
+            .unwrap()
             .expect("withdraw_root cell should has been assigned");
-
-        // sanity check
-        let evm_rows = block.circuits_params.max_evm_rows;
-        if evm_rows >= 2 {
-            assert_eq!(final_withdraw_root_cell.row_offset, evm_rows - 2);
-        }
 
         let withdraw_root_rlc = challenges
             .evm_word()
@@ -1241,9 +1424,12 @@ impl<F: Field> ExecutionConfig<F> {
             ("EVM_lookup_tx", TX_TABLE_LOOKUPS),
             ("EVM_lookup_rw", RW_TABLE_LOOKUPS),
             ("EVM_lookup_bytecode", BYTECODE_TABLE_LOOKUPS),
+            #[cfg(feature = "dual-bytecode")]
+            ("EVM_lookup_bytecode1", BYTECODE_TABLE_LOOKUPS),
             ("EVM_lookup_block", BLOCK_TABLE_LOOKUPS),
             ("EVM_lookup_copy", COPY_TABLE_LOOKUPS),
             ("EVM_lookup_keccak", KECCAK_TABLE_LOOKUPS),
+            ("EVM_lookup_sha256", SHA256_TABLE_LOOKUPS),
             ("EVM_lookup_exp", EXP_TABLE_LOOKUPS),
             ("EVM_lookup_sig", SIG_TABLE_LOOKUPS),
             ("EVM_lookup_modexp", MODEXP_TABLE_LOOKUPS),
@@ -1278,7 +1464,7 @@ impl<F: Field> ExecutionConfig<F> {
         region: &mut Region<'_, F>,
         offset_begin: usize,
         offset_end: usize,
-        block: &Block<F>,
+        block: &Block,
         transaction: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -1290,13 +1476,14 @@ impl<F: Field> ExecutionConfig<F> {
         }
         assert_eq!(height, 1);
         assert!(step.rw_indices.is_empty());
-        assert!(matches!(step.execution_state, ExecutionState::EndBlock));
+        assert!(matches!(step.execution_state, ExecutionState::Padding));
 
         // Disable access to next step deliberately for "repeatable" step
         let region = &mut CachedRegion::<'_, '_, F>::new(
             region,
             challenges,
             self.advices.to_vec(),
+            1,
             1,
             offset_begin,
         );
@@ -1316,7 +1503,7 @@ impl<F: Field> ExecutionConfig<F> {
         &self,
         region: &mut Region<'_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         transaction: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -1332,6 +1519,7 @@ impl<F: Field> ExecutionConfig<F> {
             challenges,
             self.advices.to_vec(),
             MAX_STEP_HEIGHT * 3,
+            height,
             offset,
         );
 
@@ -1359,14 +1547,14 @@ impl<F: Field> ExecutionConfig<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         transaction: &Transaction,
         call: &Call,
         step: &ExecStep,
         verbose: bool,
     ) -> Result<(), Error> {
         if verbose
-            && !(matches!(step.execution_state, ExecutionState::EndBlock)
+            && !(matches!(step.execution_state, ExecutionState::Padding)
                 && step.rw_indices.is_empty())
         {
             log::trace!(
@@ -1393,6 +1581,7 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::EndTx => assign_exec_step!(self.end_tx_gadget),
             ExecutionState::EndInnerBlock => assign_exec_step!(self.end_inner_block_gadget),
             ExecutionState::EndBlock => assign_exec_step!(self.end_block_gadget),
+            ExecutionState::Padding => assign_exec_step!(self.padding_gadget),
             // opcode
             ExecutionState::ADD_SUB => assign_exec_step!(self.add_sub_gadget),
             ExecutionState::ADDMOD => assign_exec_step!(self.addmod_gadget),
@@ -1422,6 +1611,7 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::JUMPI => assign_exec_step!(self.jumpi_gadget),
             ExecutionState::LOG => assign_exec_step!(self.log_gadget),
             ExecutionState::MEMORY => assign_exec_step!(self.memory_gadget),
+            ExecutionState::MCOPY => assign_exec_step!(self.mcopy_gadget),
             ExecutionState::MSIZE => assign_exec_step!(self.msize_gadget),
             ExecutionState::MUL_DIV_MOD => assign_exec_step!(self.mul_div_mod_gadget),
             ExecutionState::MULMOD => assign_exec_step!(self.mulmod_gadget),
@@ -1439,6 +1629,8 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::BLOCKCTXU64 => assign_exec_step!(self.block_ctx_u64_gadget),
             ExecutionState::BLOCKCTXU160 => assign_exec_step!(self.block_ctx_u160_gadget),
             ExecutionState::BLOCKCTXU256 => assign_exec_step!(self.block_ctx_u256_gadget),
+            #[cfg(feature = "scroll")]
+            ExecutionState::DIFFICULTY => assign_exec_step!(self.difficulty_gadget),
             ExecutionState::BLOCKHASH => assign_exec_step!(self.blockhash_gadget),
             ExecutionState::SELFBALANCE => assign_exec_step!(self.selfbalance_gadget),
             ExecutionState::CREATE => assign_exec_step!(self.create_gadget),
@@ -1455,6 +1647,8 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::SIGNEXTEND => assign_exec_step!(self.signextend_gadget),
             ExecutionState::SLOAD => assign_exec_step!(self.sload_gadget),
             ExecutionState::SSTORE => assign_exec_step!(self.sstore_gadget),
+            ExecutionState::TLOAD => assign_exec_step!(self.tload_gadget),
+            ExecutionState::TSTORE => assign_exec_step!(self.tstore_gadget),
             ExecutionState::STOP => assign_exec_step!(self.stop_gadget),
             ExecutionState::SWAP => assign_exec_step!(self.swap_gadget),
             // dummy errors
@@ -1556,7 +1750,7 @@ impl<F: Field> ExecutionConfig<F> {
 
         // enable with `CHECK_RW_LOOKUP=true`
         if *CHECK_RW_LOOKUP && verbose {
-            let is_padding_step = matches!(step.execution_state, ExecutionState::EndBlock)
+            let is_padding_step = matches!(step.execution_state, ExecutionState::Padding)
                 && step.rw_indices.is_empty();
             if !is_padding_step {
                 // expensive function call
@@ -1601,7 +1795,7 @@ impl<F: Field> ExecutionConfig<F> {
         step: &ExecStep,
         call: &Call,
         transaction: &Transaction,
-        block: &Block<F>,
+        block: &Block,
         challenges: &Challenges<Value<F>>,
     ) {
         let mut evm_randomness = F::zero();

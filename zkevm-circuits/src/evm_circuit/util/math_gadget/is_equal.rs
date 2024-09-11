@@ -1,7 +1,9 @@
-use crate::evm_circuit::util::{
-    constraint_builder::EVMConstraintBuilder, math_gadget::*, transpose_val_ret, CachedRegion,
+use crate::{
+    evm_circuit::util::{
+        constraint_builder::EVMConstraintBuilder, math_gadget::*, transpose_val_ret, CachedRegion,
+    },
+    util::Field,
 };
-use eth_types::Field;
 use halo2_proofs::{
     circuit::Value,
     plonk::{Error, Expression},
@@ -55,10 +57,12 @@ impl<F: Field> IsEqualGadget<F> {
 #[cfg(test)]
 mod tests {
     use super::{test_util::*, *};
-    use crate::evm_circuit::util::{
-        constraint_builder::ConstrainBuilderCommon, CachedRegion, Cell,
+    use crate::{
+        evm_circuit::util::{constraint_builder::ConstrainBuilderCommon, CachedRegion, Cell},
+        util::Field,
     };
     use eth_types::*;
+    use gadgets::ToScalar;
     use halo2_proofs::{halo2curves::bn256::Fr, plonk::Error};
 
     #[derive(Clone)]
@@ -99,7 +103,7 @@ mod tests {
     fn test_isequal_0() {
         try_test!(
             IsEqualGadgetTestContainer<Fr>,
-            vec![Word::from(0), Word::from(0)],
+            [Word::from(0), Word::from(0)],
             true,
         );
     }
@@ -108,7 +112,7 @@ mod tests {
     fn test_isequal_1() {
         try_test!(
             IsEqualGadgetTestContainer<Fr>,
-            vec![Word::from(1), Word::from(1)],
+            [Word::from(1), Word::from(1)],
             true,
         );
     }
@@ -117,7 +121,7 @@ mod tests {
     fn test_isequal_1000() {
         try_test!(
             IsEqualGadgetTestContainer<Fr>,
-            vec![Word::from(1000), Word::from(1000)],
+            [Word::from(1000), Word::from(1000)],
             true,
         );
     }
@@ -126,7 +130,7 @@ mod tests {
     fn test_isequal_1_0() {
         try_test!(
             IsEqualGadgetTestContainer<Fr>,
-            vec![Word::from(1), Word::from(0)],
+            [Word::from(1), Word::from(0)],
             false,
         );
     }
@@ -135,7 +139,7 @@ mod tests {
     fn test_isequal_0_1() {
         try_test!(
             IsEqualGadgetTestContainer<Fr>,
-            vec![Word::from(0), Word::from(1)],
+            [Word::from(0), Word::from(1)],
             false,
         );
     }

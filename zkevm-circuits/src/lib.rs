@@ -5,20 +5,23 @@
 #![allow(incomplete_features)]
 // Needed by DummyGadget in evm circuit
 #![feature(adt_const_params)]
-#![feature(array_zip)]
+#![feature(trait_alias)]
 #![feature(slice_group_by)]
+#![feature(lazy_cell)]
 // Needed by some builder patterns in testing modules.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Temporary until we have more of the crate implemented.
 #![allow(dead_code)]
 // We want to have UPPERCASE idents sometimes.
 #![allow(clippy::upper_case_acronyms)]
+#![allow(clippy::collapsible_else_if)]
 #![allow(clippy::result_large_err)] // it's large, but what can we do?
 // Catch documentation errors caused by code changes.
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 #![deny(clippy::debug_assert_with_mut_call)]
+#![deny(clippy::inconsistent_struct_constructor)]
 // We have too many cast between `usize` and `u64`,
 // we'd better ensure usize is 64-bit on target arch.
 #[cfg(not(target_pointer_width = "64"))]
@@ -38,6 +41,7 @@ pub mod sig_circuit;
 // we don't use this for aggregation
 //pub mod root_circuit;
 pub mod modexp_circuit;
+pub mod sha256_circuit;
 pub mod state_circuit;
 pub mod super_circuit;
 pub mod table;

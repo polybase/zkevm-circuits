@@ -16,10 +16,10 @@ use crate::{
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{Expr, Field},
 };
 use bus_mapping::evm::OpcodeId;
-use eth_types::{Field, ToLittleEndian, U256};
+use eth_types::{ToLittleEndian, U256};
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 /// ShlShrGadget verifies opcode SHL and SHR.
@@ -157,21 +157,20 @@ impl<F: Field> ExecutionGadget<F> for ShlShrGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
         let indices = [step.rw_indices[0], step.rw_indices[1], step.rw_indices[2]];
         let [pop1, pop2, push] = indices.map(|idx| block.rws[idx].stack_value());
         let shf0 = u64::from(pop1.to_le_bytes()[0]);
         let shf_lt256 = pop1
             .to_le_bytes()
             .iter()
-            .fold(Some(0_u64), |acc, val| {
-                acc.and_then(|acc| acc.checked_add(u64::from(*val)))
-            })
+            .try_fold(0_u64, |acc, val| acc.checked_add(u64::from(*val)))
             .unwrap()
             - shf0;
         let divisor = if shf_lt256 == 0 {

@@ -16,15 +16,14 @@ use crate::{
             not, or, select, sum, Cell, CellType, MemoryAddress,
         },
     },
-    util::Expr,
+    util::{Expr, Field},
 };
 use array_init::array_init;
 use eth_types::{
     evm_types::{GasCost, MAX_EXPANDED_MEMORY_ADDRESS},
-    Field, ToLittleEndian, U256,
+    ToLittleEndian, U256,
 };
 use halo2_proofs::{
-    arithmetic::FieldExt,
     circuit::Value,
     plonk::{Error, Expression},
 };
@@ -32,16 +31,7 @@ use itertools::Itertools;
 
 /// Decodes the usable part of an address stored in a Word
 pub(crate) mod address_low {
-    use crate::evm_circuit::{
-        param::N_BYTES_MEMORY_ADDRESS,
-        util::{from_bytes, Word},
-    };
-    use eth_types::Field;
-    use halo2_proofs::plonk::Expression;
-
-    pub(crate) fn expr<F: Field>(address: &Word<F>) -> Expression<F> {
-        from_bytes::expr(&address.cells[..N_BYTES_MEMORY_ADDRESS])
-    }
+    use crate::evm_circuit::param::N_BYTES_MEMORY_ADDRESS;
 
     pub(crate) fn value(address: [u8; 32]) -> u64 {
         let mut bytes = [0; 8];
@@ -50,27 +40,8 @@ pub(crate) mod address_low {
     }
 }
 
-/// The sum of bytes of the address that are unused for most calculations on the
-/// address
-pub(crate) mod address_high {
-    use crate::evm_circuit::{
-        param::N_BYTES_MEMORY_ADDRESS,
-        util::{from_bytes, Word},
-    };
-    use eth_types::Field;
-    use halo2_proofs::plonk::Expression;
-
-    pub(crate) fn expr<F: Field>(address: &Word<F>) -> Expression<F> {
-        from_bytes::expr(&address.cells[N_BYTES_MEMORY_ADDRESS..])
-    }
-
-    pub(crate) fn value<F: Field>(address: [u8; 32]) -> F {
-        from_bytes::value::<F>(&address[N_BYTES_MEMORY_ADDRESS..])
-    }
-}
-
 /// Memory address trait to adapt for right and Uint overflow cases.
-pub(crate) trait CommonMemoryAddressGadget<F: FieldExt> {
+pub(crate) trait CommonMemoryAddressGadget<F: Field> {
     fn construct_self(cb: &mut EVMConstraintBuilder<F>) -> Self;
 
     /// Return the memory address (offset + length).
@@ -728,23 +699,23 @@ impl<F: Field, const N: usize, const N_BYTES_MEMORY_WORD_SIZE: usize>
     MemoryExpansionGadget<F, N, N_BYTES_MEMORY_WORD_SIZE>
 {
     /// Input requirements:
-    /// - `curr_memory_word_size < 256**MAX_MEMORY_SIZE_IN_BYTES`
-    /// - `address < 32 * 256**MAX_MEMORY_SIZE_IN_BYTES`
+    /// - `curr_memory_word_size < 256**N_BYTES_MEMORY_WORD_SIZE`
+    /// - `address < 32 * 256** N_BYTES_MEMORY_WORD_SIZE`
     /// Output ranges:
-    /// - `next_memory_word_size < 256**MAX_MEMORY_SIZE_IN_BYTES`
-    /// - `gas_cost <= GAS_MEM*256**MAX_MEMORY_SIZE_IN_BYTES + 256**MAX_QUAD_COST_IN_BYTES`
+    /// - `next_memory_word_size < 256**N_BYTES_MEMORY_WORD_SIZE`
+    /// - `gas_cost <= GAS_MEM*256**N_BYTES_MEMORY_WORD_SIZE + 256**N_BYTES_GAS`
     pub(crate) fn construct(
         cb: &mut EVMConstraintBuilder<F>,
         addresses: [Expression<F>; N],
     ) -> Self {
         // Calculate the memory size of the memory access
-        // `address_memory_word_size < 256**MAX_MEMORY_SIZE_IN_BYTES`
+        // `address_memory_word_size < 256**N_BYTES_MEMORY_WORD_SIZE`
         let memory_word_sizes =
             addresses.map(|address| MemoryWordSizeGadget::construct(cb, address));
 
         // The memory size needs to be updated if this memory access
         // requires expanding the memory.
-        // `next_memory_word_size < 256**MAX_MEMORY_SIZE_IN_BYTES`
+        // `next_memory_word_size < 256**N_BYTES_MEMORY_WORD_SIZE`
         let curr_memory_word_size = cb.curr.state.memory_word_size.expr();
         let mut next_memory_word_size = curr_memory_word_size.clone();
         let max_memory_word_sizes = array_init(|idx| {
@@ -759,7 +730,7 @@ impl<F: Field, const N: usize, const N_BYTES_MEMORY_WORD_SIZE: usize>
 
         // Calculate the quad memory cost for the current and next memory size.
         // These quad costs will also be range limited to `<
-        // 256**MAX_QUAD_COST_IN_BYTES`.
+        // 256**N_BYTES_GAS`.
         let curr_quad_memory_cost = ConstantDivisionGadget::construct(
             cb,
             curr_memory_word_size.clone() * curr_memory_word_size.clone(),
@@ -774,7 +745,7 @@ impl<F: Field, const N: usize, const N_BYTES_MEMORY_WORD_SIZE: usize>
         // Calculate the gas cost for the memory expansion.
         // This gas cost is the difference between the next and current memory
         // costs. `gas_cost <=
-        // GAS_MEM*256**MAX_MEMORY_SIZE_IN_BYTES + 256**MAX_QUAD_COST_IN_BYTES`
+        // GAS_MEM*256**N_BYTES_MEMORY_WORD_SIZE + 256**N_BYTES_GAS`
         let gas_cost = GasCost::MEMORY_EXPANSION_LINEAR_COEFF.expr()
             * (next_memory_word_size.clone() - curr_memory_word_size)
             + (next_quad_memory_cost.quotient() - curr_quad_memory_cost.quotient());
@@ -867,11 +838,11 @@ impl<F: Field, const GAS_COPY: GasCost> MemoryCopierGasGadget<F, GAS_COPY> {
     pub const WORD_SIZE: u64 = 32u64;
 
     /// Input requirements:
-    /// - `curr_memory_size < 256**MAX_MEMORY_SIZE_IN_BYTES`
-    /// - `address < 32 * 256**MAX_MEMORY_SIZE_IN_BYTES`
+    /// - `curr_memory_size < 256**N_BYTES_MEMORY_WORD_SIZE`
+    /// - `address < 32 * 256**N_BYTES_MEMORY_WORD_SIZE`
     /// Output ranges:
-    /// - `next_memory_size < 256**MAX_MEMORY_SIZE_IN_BYTES`
-    /// - `gas_cost <= GAS_MEM*256**MAX_MEMORY_SIZE_IN_BYTES + 256**MAX_QUAD_COST_IN_BYTES`
+    /// - `next_memory_size < 256**N_BYTES_MEMORY_WORD_SIZE`
+    /// - `gas_cost <= GAS_MEM*256**N_BYTES_MEMORY_WORD_SIZE + 256**N_BYTES_GAS`
     pub(crate) fn construct(
         cb: &mut EVMConstraintBuilder<F>,
         num_bytes: Expression<F>,

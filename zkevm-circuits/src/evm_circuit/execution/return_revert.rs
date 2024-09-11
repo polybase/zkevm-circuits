@@ -4,7 +4,7 @@ use crate::{
         param::{N_BYTES_MEMORY_ADDRESS, N_BYTES_MEMORY_WORD_SIZE, STACK_CAPACITY},
         step::ExecutionState,
         util::{
-            common_gadget::{get_copy_bytes, RestoreContextGadget},
+            common_gadget::{get_copy_bytes, BytecodeLookupGadget, RestoreContextGadget},
             constraint_builder::{
                 ConstrainBuilderCommon, EVMConstraintBuilder, ReversionInfo, StepStateTransition,
                 Transition::{Delta, To},
@@ -18,19 +18,20 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::{AccountFieldTag, CallContextFieldTag},
-    util::Expr,
+    util::{Expr, Field},
 };
-use bus_mapping::{circuit_input_builder::CopyDataType, state_db::CodeDB};
+use bus_mapping::circuit_input_builder::CopyDataType;
 use eth_types::{
     evm_types::{GasCost, OpcodeId},
-    Field, ToScalar, U256,
+    utils::{hash_code, hash_code_keccak},
+    ToWord,
 };
-use ethers_core::utils::keccak256;
+use gadgets::ToScalar;
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReturnRevertGadget<F> {
-    opcode: Cell<F>,
+    opcode_gadget: BytecodeLookupGadget<F>,
     // check if it is REVERT opcode
     is_revert: IsEqualGadget<F>,
 
@@ -65,15 +66,15 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
     const EXECUTION_STATE: ExecutionState = ExecutionState::RETURN_REVERT;
 
     fn configure(cb: &mut EVMConstraintBuilder<F>) -> Self {
-        let opcode = cb.query_cell();
+        let opcode_gadget = BytecodeLookupGadget::construct(cb);
 
-        cb.opcode_lookup(opcode.expr(), 1.expr());
-        let is_revert = IsEqualGadget::construct(cb, opcode.expr(), OpcodeId::REVERT.expr());
+        let is_revert =
+            IsEqualGadget::construct(cb, opcode_gadget.opcode.expr(), OpcodeId::REVERT.expr());
 
         // constrain op codes
         cb.require_in_set(
             "RETURN_REVERT state is for RETURN or REVERT",
-            opcode.expr(),
+            opcode_gadget.opcode.expr(),
             vec![OpcodeId::RETURN.expr(), OpcodeId::REVERT.expr()],
         );
 
@@ -134,6 +135,8 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
             // circuit does the lookup to poseidon table.
             let code_hash = cb.query_cell_phase2();
             let deployed_bytecode_rlc = cb.query_cell_phase2();
+            // if contract is deployed, there must be some code bytes
+            // need to be copied
             cb.copy_table_lookup(
                 cb.curr.state.call_id.expr(),
                 CopyDataType::Memory.expr(),
@@ -323,25 +326,25 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
         });
 
         Self {
-            opcode,
+            opcode_gadget,
             is_revert,
             range,
             deployed_bytecode_rlc,
             is_success,
+            restore_context,
             copy_length,
             copy_rw_increase,
             copy_rw_increase_is_zero,
             return_data_offset,
             return_data_length,
-            restore_context,
             memory_expansion,
             code_hash,
             prev_code_hash,
             keccak_code_hash,
             prev_keccak_code_hash,
             code_size,
-            address,
             caller_id,
+            address,
             reversion_info,
         }
     }
@@ -350,13 +353,14 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _tx: &Transaction,
         call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
         let opcode = F::from(step.opcode.unwrap().as_u64());
-        self.opcode.assign(region, offset, Value::known(opcode))?;
+        self.opcode_gadget
+            .assign(region, offset, block, call, step)?;
 
         self.is_revert
             .assign(region, offset, opcode, F::from(OpcodeId::REVERT.as_u64()))?;
@@ -410,21 +414,17 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
             )?;
 
             // keccak hash of code.
-            let keccak_code_hash = keccak256(&deployed_bytecode);
+            let keccak_code_hash = hash_code_keccak(&deployed_bytecode);
             self.keccak_code_hash.assign(
                 region,
                 offset,
-                region.word_rlc(U256::from_big_endian(&keccak_code_hash)),
+                region.word_rlc(keccak_code_hash.to_word()),
             )?;
 
             // poseidon hash of code.
-            let mut code_hash = CodeDB::hash(&deployed_bytecode).to_fixed_bytes();
-            code_hash.reverse();
-            self.code_hash.assign(
-                region,
-                offset,
-                region.code_hash(U256::from_little_endian(&code_hash)),
-            )?;
+            let code_hash = hash_code(&deployed_bytecode);
+            self.code_hash
+                .assign(region, offset, region.code_hash(code_hash.to_word()))?;
 
             // code size.
             self.code_size.assign(
@@ -503,13 +503,14 @@ impl<F: Field> ExecutionGadget<F> for ReturnRevertGadget<F> {
 mod test {
     use crate::test_util::CircuitTestBuilder;
     use eth_types::{
-        address, bytecode,
-        evm_types::OpcodeId,
-        geth_types::{Account, GethData},
-        Address, Bytecode, ToWord, Word, U256,
+        address, bytecode, evm_types::OpcodeId, geth_types::Account, Address, Bytecode, ToWord,
+        Word,
     };
     use itertools::Itertools;
     use mock::{eth, TestContext, MOCK_ACCOUNTS};
+
+    #[cfg(feature = "enable-stack")]
+    use eth_types::{geth_types::GethData, U256};
 
     const CALLEE_ADDRESS: Address = Address::repeat_byte(0xff);
     const CALLER_ADDRESS: Address = Address::repeat_byte(0x34);
@@ -933,10 +934,12 @@ mod test {
                 RETURNDATACOPY
             });
 
-            let block: GethData = TestContext::<2, 1>::simple_ctx_with_bytecode(bytecode.clone())
-                .unwrap()
-                .into();
+            #[cfg(feature = "enable-stack")]
             if is_return {
+                let block: GethData =
+                    TestContext::<2, 1>::simple_ctx_with_bytecode(bytecode.clone())
+                        .unwrap()
+                        .into();
                 // collect return opcode, retrieve next step, assure both contract create
                 // successfully
                 let created_contract_addr = block.geth_traces[0]
@@ -945,7 +948,7 @@ mod test {
                     .enumerate()
                     .filter(|(_, s)| s.op == OpcodeId::RETURN)
                     .flat_map(|(index, _)| block.geth_traces[0].struct_logs.get(index + 1))
-                    .flat_map(|s| s.stack.nth_last(0)) // contract addr on stack top
+                    .flat_map(|s| s.stack.last()) // contract addr on stack top
                     .collect_vec();
                 assert!(created_contract_addr.len() == 2); // both contract addr exist
                 created_contract_addr
@@ -959,7 +962,7 @@ mod test {
                     .enumerate()
                     .filter(|(_, s)| s.op == OpcodeId::RETURNDATASIZE)
                     .flat_map(|(index, _)| block.geth_traces[0].struct_logs.get(index + 1))
-                    .flat_map(|s| s.stack.nth_last(0)) // returndata size on stack top
+                    .flat_map(|s| s.stack.last()) // returndata size on stack top
                     .collect_vec();
                 assert!(return_data_size.len() == 2);
                 return_data_size

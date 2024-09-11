@@ -1,3 +1,13 @@
+use bus_mapping::l2_predeployed::message_queue::{
+    ADDRESS as MESSAGE_QUEUE, WITHDRAW_TRIE_ROOT_SLOT,
+};
+use gadgets::ToScalar;
+use halo2_proofs::{
+    circuit::{Cell as AssignedCell, Value},
+    plonk::{Error, Expression},
+};
+use std::sync::Mutex;
+
 use crate::{
     evm_circuit::{
         execution::ExecutionGadget,
@@ -11,20 +21,13 @@ use crate::{
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    table::{CallContextFieldTag, TxContextFieldTag},
-    util::Expr,
-};
-use bus_mapping::l2_predeployed::message_queue::{
-    ADDRESS as MESSAGE_QUEUE, WITHDRAW_TRIE_ROOT_SLOT,
-};
-use eth_types::{Field, ToScalar};
-use halo2_proofs::{
-    circuit::{Cell as AssignedCell, Value},
-    plonk::{Error, Expression},
+    table::{BlockContextFieldTag, CallContextFieldTag, TxContextFieldTag},
+    util::{Expr, Field},
 };
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct EndBlockGadget<F> {
+    chain_id: Cell<F>,
     total_txs: Cell<F>,
     total_txs_is_max_txs: IsEqualGadget<F>,
     is_empty_block: IsZeroGadget<F>,
@@ -32,23 +35,59 @@ pub(crate) struct EndBlockGadget<F> {
     max_txs: Cell<F>,
     phase2_withdraw_root: Cell<F>,
     phase2_withdraw_root_prev: Cell<F>,
-    pub withdraw_root_assigned: std::cell::RefCell<Option<AssignedCell>>,
+    pub withdraw_root_assigned: Mutex<Option<AssignedCell>>,
 }
 
-const EMPTY_BLOCK_N_RWS: u64 = 0;
+impl<F: Clone> Clone for EndBlockGadget<F> {
+    fn clone(&self) -> Self {
+        let withdraw_root_assigned: Option<AssignedCell> =
+            *self.withdraw_root_assigned.lock().unwrap();
+        Self {
+            withdraw_root_assigned: Mutex::new(withdraw_root_assigned),
+            chain_id: self.chain_id.clone(),
+            total_txs: self.total_txs.clone(),
+            total_txs_is_max_txs: self.total_txs_is_max_txs.clone(),
+            is_empty_block: self.is_empty_block.clone(),
+            max_rws: self.max_rws.clone(),
+            max_txs: self.max_txs.clone(),
+            phase2_withdraw_root: self.phase2_withdraw_root.clone(),
+            phase2_withdraw_root_prev: self.phase2_withdraw_root_prev.clone(),
+        }
+    }
+}
 
+/// The goal of EndBlockGadget is to:
+///     0. expose withdraw root. Then it can be copied into pi circuit.
+///     1. constrain rws of evm circuit is same to rws of state circuit.
+///         We use 2 StartOp rw lookup to do this.
+///     2. constrain all txs inside tx circuit are processed inside evm circuit.
+///         (We don't need to constrain txs in evm circuit are not in tx circuit,
+///         since there are tx lookups)
+/// To achieve the above goal:
+///     We need to pass "rwc" and "call_id" all the way to EndBlock.
+///     Then "rwc" can be used for goal1.
+///     For goal2 this gadget can read tx_id from CallContext using call_id.
 impl<F: Field> ExecutionGadget<F> for EndBlockGadget<F> {
     const NAME: &'static str = "EndBlock";
 
     const EXECUTION_STATE: ExecutionState = ExecutionState::EndBlock;
 
     fn configure(cb: &mut EVMConstraintBuilder<F>) -> Self {
+        let chain_id = cb.query_cell();
         let max_txs = cb.query_copy_cell();
         let max_rws = cb.query_copy_cell();
         let total_txs = cb.query_cell();
         let total_txs_is_max_txs = IsEqualGadget::construct(cb, total_txs.expr(), max_txs.expr());
         let phase2_withdraw_root = cb.query_copy_cell_phase2();
         let phase2_withdraw_root_prev = cb.query_cell_phase2();
+
+        // Lookup block table with chain_id
+        cb.block_lookup(
+            BlockContextFieldTag::ChainId.expr(),
+            cb.curr.state.block_number.expr(),
+            chain_id.expr(),
+        );
+
         // Note that rw_counter starts at 1
         let is_empty_block =
             IsZeroGadget::construct(cb, cb.curr.state.rw_counter.clone().expr() - 1.expr());
@@ -115,10 +154,6 @@ impl<F: Field> ExecutionGadget<F> for EndBlockGadget<F> {
         // We conclude that the number of meaningful entries in the rw_table
         // is total_rws.
 
-        // cb.step_last(|cb| {
-        //     // TODO: Handle reward to coinbase.  Depends on spec:
-        //     // https://github.com/privacy-scaling-explorations/zkevm-specs/issues/290
-        // });
         cb.not_step_last(|cb| {
             // Propagate rw_counter and call_id all the way down.
             cb.require_step_state_transition(StepStateTransition {
@@ -129,6 +164,7 @@ impl<F: Field> ExecutionGadget<F> for EndBlockGadget<F> {
         });
 
         Self {
+            chain_id,
             max_txs,
             max_rws,
             phase2_withdraw_root,
@@ -144,11 +180,13 @@ impl<F: Field> ExecutionGadget<F> for EndBlockGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
         _: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
+        self.chain_id
+            .assign(region, offset, Value::known(F::from(block.chain_id)))?;
         self.is_empty_block
             .assign(region, offset, F::from(step.rw_counter as u64 - 1))?;
         let max_rws = F::from(block.circuits_params.max_rws as u64);
@@ -172,10 +210,9 @@ impl<F: Field> ExecutionGadget<F> for EndBlockGadget<F> {
             offset,
             region.word_rlc(block.prev_withdraw_root),
         )?;
-
-        self.withdraw_root_assigned
-            .borrow_mut()
-            .replace(withdraw_root.cell());
+        if let Some(cell) = withdraw_root {
+            *self.withdraw_root_assigned.lock().unwrap() = Some(cell.cell());
+        }
         // TODO: now we do not export withdraw_root_prev for we have only one
         // phase2 cell which is enabled for copy constraint
         // self.withdraw_root_prev_assigned
@@ -185,8 +222,8 @@ impl<F: Field> ExecutionGadget<F> for EndBlockGadget<F> {
         // When rw_indices is not empty, we're at the last row (at a fixed offset),
         // where we need to access the max_rws and max_txs constant.
         if !step.rw_indices.is_empty() {
-            region.constrain_constant(max_rws_assigned, max_rws)?;
-            region.constrain_constant(max_txs_assigned, max_txs)?;
+            region.constrain_constant(max_rws_assigned.unwrap(), max_rws)?;
+            region.constrain_constant(max_txs_assigned.unwrap(), max_txs)?;
         }
         Ok(())
     }

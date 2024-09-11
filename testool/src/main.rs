@@ -1,3 +1,5 @@
+#![feature(lazy_cell)]
+
 /// Execute the bytecode from an empty state and run the EVM and State circuits
 mod abi;
 mod compiler;
@@ -22,7 +24,7 @@ use std::{
     path::PathBuf,
     time::SystemTime,
 };
-use strum::EnumString;
+use strum_macros::EnumString;
 
 const REPORT_FOLDER: &str = "report";
 const CODEHASH_FILE: &str = "./codehash.txt";
@@ -32,7 +34,7 @@ const TEST_IDS_FILE: &str = "./test_ids.txt";
 extern crate prettytable;
 
 #[allow(non_camel_case_types)]
-#[derive(PartialEq, Parser, EnumString, Debug)]
+#[derive(PartialEq, Parser, EnumString, Debug, Clone, Copy)]
 enum Circuits {
     basic,
     sc,
@@ -92,30 +94,34 @@ struct Args {
 }
 
 fn read_test_ids(file_path: &str) -> Result<Vec<String>> {
-    log::info!("read_test_ids from {}", file_path);
-    let mut test_ids = vec![];
-    let file = File::open(file_path)?;
-    for line in BufReader::new(file).lines() {
-        test_ids.push(line?.trim().to_string());
-    }
-
-    let total = test_ids.len();
-    let start = env::var("TESTOOL_IDS_START")
+    let worker_index = env::var("WORKER_INDEX")
         .ok()
         .and_then(|val| val.parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(total);
-    let len = env::var("TESTOOL_IDS_LEN")
+        .expect("WORKER_INDEX not set");
+    let total_workers = env::var("TOTAL_WORKERS")
         .ok()
         .and_then(|val| val.parse::<usize>().ok())
-        .unwrap_or(total);
-    log::info!("ENV TESTOOL_IDS_START = {start}, TESTOOL_IDS_LEN = {len}");
+        .expect("TOTAL_WORKERS not set");
+    info!("total workers: {total_workers}, worker index: {worker_index}");
 
-    let end = total.min(start + len);
+    info!("read_test_ids from {}", file_path);
+    let mut total_jobs = 0;
+    let test_ids = BufReader::new(File::open(file_path)?)
+        .lines()
+        .map(|r| r.map(|line| line.trim().to_string()))
+        .inspect(|_| total_jobs += 1)
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            if idx % total_workers == worker_index {
+                Some(line)
+            } else {
+                None
+            }
+        })
+        .collect::<Result<Vec<String>, std::io::Error>>()?;
 
-    let result = test_ids[start..end].to_vec();
-    log::info!("read_test_ids total size {}", result.len());
-    Ok(result)
+    info!("read_test_ids {} of {total_jobs}", test_ids.len());
+    Ok(test_ids)
 }
 
 fn write_test_ids(test_ids: &[String]) -> Result<()> {
@@ -125,7 +131,11 @@ fn write_test_ids(test_ids: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_single_test(test: StateTest, circuits_config: CircuitsConfig) -> Result<()> {
+fn run_single_test(
+    test: StateTest,
+    suite: TestSuite,
+    circuits_config: CircuitsConfig,
+) -> Result<()> {
     log::info!("run single test {}", &test);
     let circuits_config = CircuitsConfig {
         verbose: true,
@@ -133,16 +143,15 @@ fn run_single_test(test: StateTest, circuits_config: CircuitsConfig) -> Result<(
     };
     //let trace = geth_trace(test.clone())?;
     //crate::utils::print_trace(trace)?;
-    log::info!(
-        "result={:?}",
-        run_test(test, TestSuite::default(), circuits_config)
-    );
+    log::info!("result={:?}", run_test(test, suite, circuits_config));
     Ok(())
 }
 
 fn go() -> Result<()> {
     //  RAYON_NUM_THREADS=1 RUST_BACKTRACE=1 cargo run -- --path
     // "tests/src/GeneralStateTestsFiller/**/" --skip-state-circuit
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
 
@@ -153,20 +162,22 @@ fn go() -> Result<()> {
 
     if let Some(oneliner) = &args.oneliner {
         let test = StateTest::parse_oneline_spec(oneliner)?;
-        run_single_test(test, circuits_config)?;
+        run_single_test(test, Default::default(), circuits_config)?;
         return Ok(());
     }
 
     let config = Config::load()?;
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     log::info!("Using suite '{}'", args.suite);
-    log::info!("Parsing and compliling tests...");
+    log::info!("Parsing and compiling tests...");
     let compiler = Compiler::new(true, Some(PathBuf::from(CODEHASH_FILE)))?;
     let suite = config.suite(&args.suite)?.clone();
     let mut state_tests = load_statetests_suite(&suite, config, compiler)?;
-    log::info!("{} tests collected in {}", state_tests.len(), suite.path);
+    log::info!(
+        "{} tests collected in {}",
+        state_tests.len(),
+        suite.paths.join(", ")
+    );
 
     if args.ls {
         let mut list: Vec<_> = state_tests.into_iter().map(|t| t.id).collect();
@@ -191,7 +202,11 @@ fn go() -> Result<()> {
             }
             bail!("test '{}' not found", test_id);
         }
-        run_single_test(state_tests_filtered.remove(0).clone(), circuits_config)?;
+        run_single_test(
+            state_tests_filtered.remove(0).clone(),
+            suite,
+            circuits_config,
+        )?;
         return Ok(());
     };
 

@@ -1,14 +1,16 @@
-use crate::evm_circuit::{
-    execution::ExecutionGadget,
-    step::ExecutionState,
-    table::{FixedTableTag, Lookup},
-    util::{
-        common_gadget::CommonErrorGadget, constraint_builder::EVMConstraintBuilder, CachedRegion,
-        Cell,
+use crate::{
+    evm_circuit::{
+        execution::ExecutionGadget,
+        step::ExecutionState,
+        table::{FixedTableTag, Lookup},
+        util::{
+            common_gadget::CommonErrorGadget, constraint_builder::EVMConstraintBuilder,
+            CachedRegion, Cell,
+        },
+        witness::{Block, Call, ExecStep, Transaction},
     },
-    witness::{Block, Call, ExecStep, Transaction},
+    util::Field,
 };
-use eth_types::Field;
 use gadgets::util::Expr;
 use halo2_proofs::{circuit::Value, plonk::Error};
 
@@ -51,7 +53,7 @@ impl<F: Field> ExecutionGadget<F> for ErrorInvalidOpcodeGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -72,24 +74,21 @@ impl<F: Field> ExecutionGadget<F> for ErrorInvalidOpcodeGadget<F> {
 mod test {
     use crate::{evm_circuit::test::rand_bytes, test_util::CircuitTestBuilder};
     use eth_types::{bytecode::Bytecode, Word};
-    use lazy_static::lazy_static;
     use mock::{generate_mock_call_bytecode, MockCallBytecodeParams, TestContext};
 
     #[cfg(feature = "scroll")]
     use eth_types::address;
 
-    lazy_static! {
-        static ref TESTING_INVALID_CODES: [Vec<u8>; 6] = [
-            // Single invalid opcode
-            vec![0x0e],
-            vec![0x4f],
-            vec![0xa5],
-            vec![0xf6],
-            vec![0xfe],
-            // Multiple invalid opcodes
-            vec![0x5c, 0x5e],
-        ];
-    }
+    static TESTING_INVALID_CODES: [&[u8]; 6] = [
+        // Single invalid opcode
+        &[0x0e],
+        &[0x4f],
+        &[0xa5],
+        &[0xf6],
+        &[0xfe],
+        // Multiple invalid opcodes
+        &[0x0c, 0x5e],
+    ];
 
     #[test]
     fn invalid_opcode_root() {
@@ -130,16 +129,6 @@ mod test {
         test_internal_ok(0x20, 0x30, &[fe_opcode]);
     }
 
-    #[cfg(not(feature = "shanghai"))]
-    #[test]
-    fn invalid_opcode_push0_for_not_shanghai() {
-        // Should test with logs in `assign_exec_step`, otherwise it could also
-        // pass (since PushGadget).
-        let push0 = 0x5f;
-        test_root_ok(&[push0]);
-        test_internal_ok(0x20, 0x00, &[push0]);
-    }
-
     // for scroll feature, treat selfdestruct_opcode as invalidcode. even this test construct oog
     // case for self_destruct, expected to meet invalid opcode error.
     #[cfg(feature = "scroll")]
@@ -170,7 +159,7 @@ mod test {
                 txs[0]
                     .from(accs[2].address)
                     .to(accs[0].address)
-                    // gas just over tx baisc gas(21000) + push gas(3), so oog for
+                    // gas just over tx basic gas(21000) + push gas(3), so oog for
                     // selfdestruct_opcode in normal geth, but treat as
                     // invalidcode with scroll feature
                     .gas(21003.into());

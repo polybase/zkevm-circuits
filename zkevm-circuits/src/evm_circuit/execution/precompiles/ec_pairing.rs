@@ -1,9 +1,11 @@
+use crate::util::Field;
 use bus_mapping::{
     circuit_input_builder::{N_BYTES_PER_PAIR, N_PAIRING_PER_OP},
     precompile::{EcPairingError, PrecompileAuxData, PrecompileCalls},
 };
-use eth_types::{evm_types::GasCost, Field, ToScalar};
+use eth_types::evm_types::GasCost;
 use gadgets::util::{and, not, or, select, Expr};
+use gadgets::ToScalar;
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 use crate::{
@@ -28,7 +30,12 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct EcPairingGadget<F> {
     // Random linear combination of input bytes to the precompile ecPairing call.
-    evm_input_rlc: Cell<F>,
+    input_bytes_rlc: Cell<F>,
+    // output bytes from ecpairing call.
+    output_bytes_rlc: Cell<F>,
+    // return bytes
+    return_bytes_rlc: Cell<F>,
+
     // Boolean output from the ecPairing call, denoting whether or not the pairing check was
     // successful.
     output: Cell<F>,
@@ -53,7 +60,7 @@ pub struct EcPairingGadget<F> {
 
     is_success: Cell<F>,
     callee_address: Cell<F>,
-    caller_id: Cell<F>,
+    is_root: Cell<F>,
     call_data_offset: Cell<F>,
     call_data_length: Cell<F>,
     return_data_offset: Cell<F>,
@@ -67,16 +74,21 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
     const EXECUTION_STATE: ExecutionState = ExecutionState::PrecompileBn256Pairing;
 
     fn configure(cb: &mut EVMConstraintBuilder<F>) -> Self {
-        let (evm_input_rlc, output) = (cb.query_cell_phase2(), cb.query_bool());
+        let (input_bytes_rlc, output_bytes_rlc, return_bytes_rlc, output) = (
+            cb.query_cell_phase2(),
+            cb.query_cell_phase2(),
+            cb.query_cell_phase2(),
+            cb.query_bool(),
+        );
 
         let n_pairs = cb.query_cell();
         let n_pairs_cmp = BinaryNumberGadget::construct(cb, n_pairs.expr());
 
-        let [is_success, callee_address, caller_id, call_data_offset, call_data_length, return_data_offset, return_data_length] =
+        let [is_success, callee_address, is_root, call_data_offset, call_data_length, return_data_offset, return_data_length] =
             [
                 CallContextFieldTag::IsSuccess,
                 CallContextFieldTag::CalleeAddress,
-                CallContextFieldTag::CallerId,
+                CallContextFieldTag::IsRoot,
                 CallContextFieldTag::CallDataOffset,
                 CallContextFieldTag::CallDataLength,
                 CallContextFieldTag::ReturnDataOffset,
@@ -138,6 +150,15 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
                 )
             },
         );
+
+        // when input is zero then input mod_192 is zero
+        cb.condition(input_is_zero.expr(), |cb| {
+            cb.require_true(
+                "when input is zero, then input mod192 is zero",
+                input_mod_192_is_zero.expr(),
+            );
+        });
+
         cb.condition(
             // (len(input) > 768) || (len(input) % 192 != 0)
             or::expr([
@@ -179,14 +200,14 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
                     0.expr(),
                     select::expr(
                         n_pairs_cmp.value_equals(1usize),
-                        evm_input_rlc.expr() * rand_pow_576.expr(), /* 576 bytes padded */
+                        input_bytes_rlc.expr() * rand_pow_576.expr(), /* 576 bytes padded */
                         select::expr(
                             n_pairs_cmp.value_equals(2usize),
-                            evm_input_rlc.expr() * rand_pow_384.expr(), /* 384 bytes padded */
+                            input_bytes_rlc.expr() * rand_pow_384.expr(), /* 384 bytes padded */
                             select::expr(
                                 n_pairs_cmp.value_equals(3usize),
-                                evm_input_rlc.expr() * rand_pow_192.expr(), /* 192 bytes padded */
-                                evm_input_rlc.expr(),                       /* 0 bytes padded */
+                                input_bytes_rlc.expr() * rand_pow_192.expr(), /* 192 bytes padded */
+                                input_bytes_rlc.expr(),                       /* 0 bytes padded */
                             ),
                         ),
                     ),
@@ -194,7 +215,7 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
                 cb.condition(n_pairs_cmp.value_equals(0usize), |cb| {
                     cb.require_zero(
                         "ecPairing: n_pairs == 0 => evm input == 0",
-                        evm_input_rlc.expr(),
+                        input_bytes_rlc.expr(),
                     );
                 });
 
@@ -244,19 +265,19 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
         );
         ///////////////////////////////// VALID END ///////////////////////////////////
 
-        let restore_context = RestoreContextGadget::construct2(
+        let restore_context = super::gen_restore_context(
             cb,
+            is_root.expr(),
             is_success.expr(),
             gas_cost.expr(),
-            0.expr(),
-            0x00.expr(),                                               // ReturnDataOffset
             select::expr(is_success.expr(), 0x20.expr(), 0x00.expr()), // ReturnDataLength
-            0.expr(),
-            0.expr(),
         );
 
         Self {
-            evm_input_rlc,
+            input_bytes_rlc,
+            output_bytes_rlc,
+            return_bytes_rlc,
+
             output,
 
             input_is_zero,
@@ -272,7 +293,7 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
 
             is_success,
             callee_address,
-            caller_id,
+            is_root,
             call_data_offset,
             call_data_length,
             return_data_offset,
@@ -285,7 +306,7 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _transaction: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -330,7 +351,7 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
                         "len(input) % 192 != 0"
                     );
                     // Consider only call_data_length bytes for EVM input.
-                    self.evm_input_rlc.assign(
+                    self.input_bytes_rlc.assign(
                         region,
                         offset,
                         keccak_rand.map(|r| {
@@ -344,6 +365,16 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
                                 r,
                             )
                         }),
+                    )?;
+                    self.output_bytes_rlc.assign(
+                        region,
+                        offset,
+                        keccak_rand.map(|r| rlc::value(aux_data.0.output_bytes.iter().rev(), r)),
+                    )?;
+                    self.return_bytes_rlc.assign(
+                        region,
+                        offset,
+                        keccak_rand.map(|r| rlc::value(aux_data.0.return_bytes.iter().rev(), r)),
                     )?;
                     // Pairing check output from ecPairing call.
                     self.output.assign(
@@ -365,7 +396,7 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
                     self.rand_pow_64.assign(
                         region,
                         offset,
-                        keccak_rand.map(|r| r.pow(&[64, 0, 0, 0])),
+                        keccak_rand.map(|r| r.pow([64, 0, 0, 0])),
                     )?;
                 }
                 Err(EcPairingError::InvalidInputLen(input_bytes)) => {
@@ -380,11 +411,13 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
                         "len(input) is expected to be invalid",
                     );
                     // Consider only call_data_length bytes for EVM input.
-                    self.evm_input_rlc.assign(
+                    self.input_bytes_rlc.assign(
                         region,
                         offset,
                         keccak_rand.map(|r| rlc::value(input_bytes.iter().rev(), r)),
                     )?;
+                    self.return_bytes_rlc
+                        .assign(region, offset, Value::known(F::zero()))?;
                     // Pairing check output from ecPairing call.
                     self.output
                         .assign(region, offset, Value::known(F::zero()))?;
@@ -405,8 +438,8 @@ impl<F: Field> ExecutionGadget<F> for EcPairingGadget<F> {
             offset,
             Value::known(call.code_address.unwrap().to_scalar().unwrap()),
         )?;
-        self.caller_id
-            .assign(region, offset, Value::known(F::from(call.caller_id as u64)))?;
+        self.is_root
+            .assign(region, offset, Value::known(F::from(call.is_root as u64)))?;
         self.call_data_offset.assign(
             region,
             offset,
@@ -444,48 +477,108 @@ mod test {
     use itertools::Itertools;
     use mock::{test_ctx::helpers::account_0_code_wallet_0_no_code, TestContext, MOCK_WALLETS};
     use rayon::iter::{ParallelBridge, ParallelIterator};
+    use std::sync::LazyLock;
 
     use crate::test_util::CircuitTestBuilder;
 
-    lazy_static::lazy_static! {
-        static ref TEST_VECTOR: Vec<PrecompileCallArgs> = {
-            let mut rng = rand::thread_rng();
-            vec![
-                PrecompileCallArgs {
-                    name: "ecPairing (valid): empty calldata",
-                    setup_code: bytecode! {},
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x00.into(),
-                    ret_offset: 0x00.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
+    static TEST_VECTOR: LazyLock<Vec<PrecompileCallArgs>> = LazyLock::new(|| {
+        let mut rng = rand::thread_rng();
+        vec![
+            PrecompileCallArgs {
+                name: "ecPairing (valid): empty calldata",
+                setup_code: bytecode! {},
+                call_data_offset: 0x00.into(),
+                call_data_length: 0x00.into(),
+                ret_offset: 0x00.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (valid): zero bytes",
+                setup_code: bytecode! {},
+                call_data_offset: 0x00.into(),
+                call_data_length: 0xC0.into(),
+                ret_offset: 0xC0.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            #[cfg(feature = "scroll")]
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): all zero bytes, len(input) == 5 * 192",
+                setup_code: bytecode! {},
+                call_data_offset: 0x00.into(),
+                call_data_length: 0x3C0.into(),
+                ret_offset: 0x3C0.into(),
+                ret_size: 0x20.into(),
+                value: 1.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (pairing true): 2 pairs",
+                setup_code: bytecode! {
+                    // G1_x1
+                    PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18da"))
+                    PUSH1(0x00)
+                    MSTORE
+                    // G1_y1
+                    PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
+                    PUSH1(0x20)
+                    MSTORE
+                    // G2_x11
+                    PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
+                    PUSH1(0x40)
+                    MSTORE
+                    // G2_x12
+                    PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
+                    PUSH1(0x60)
+                    MSTORE
+                    // G2_y11
+                    PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
+                    PUSH1(0x80)
+                    MSTORE
+                    // G2_y12
+                    PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
+                    PUSH1(0xA0)
+                    MSTORE
+                    // G1_x2
+                    PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
+                    PUSH1(0xC0)
+                    MSTORE
+                    // G1_y2
+                    PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
+                    PUSH1(0xE0)
+                    MSTORE
+                    // G2_x21
+                    PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
+                    PUSH2(0x100)
+                    MSTORE
+                    // G2_x22
+                    PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
+                    PUSH2(0x120)
+                    MSTORE
+                    // G2_y21
+                    PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
+                    PUSH2(0x140)
+                    MSTORE
+                    // G2_y22
+                    PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
+                    PUSH2(0x160)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "ecPairing (valid): zero bytes",
-                    setup_code: bytecode! {},
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0xC0.into(),
-                    ret_offset: 0xC0.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
-                },
-                #[cfg(feature = "scroll")]
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): all zero bytes, len(input) == 5 * 192",
-                    setup_code: bytecode! {},
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x3C0.into(),
-                    ret_offset: 0x3C0.into(),
-                    ret_size: 0x20.into(),
-                    value: 1.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
-                },
-                PrecompileCallArgs {
-                    name: "ecPairing (pairing true): 2 pairs",
-                    setup_code: bytecode! {
+                call_data_offset: 0x00.into(),
+                call_data_length: 0x180.into(),
+                ret_offset: 0x180.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (pairing true): 4 pairs with random G1s",
+                setup_code: {
+                    let mut setup_code = bytecode! {
                         // G1_x1
                         PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18da"))
                         PUSH1(0x00)
@@ -534,544 +627,485 @@ mod test {
                         PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
                         PUSH2(0x160)
                         MSTORE
-                    },
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x180.into(),
-                    ret_offset: 0x180.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
-                },
-                PrecompileCallArgs {
-                    name: "ecPairing (pairing true): 4 pairs with random G1s",
-                    setup_code: {
-                        let mut setup_code = bytecode! {
-                            // G1_x1
-                            PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18da"))
-                            PUSH1(0x00)
-                            MSTORE
-                            // G1_y1
-                            PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
-                            PUSH1(0x20)
-                            MSTORE
-                            // G2_x11
-                            PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
-                            PUSH1(0x40)
-                            MSTORE
-                            // G2_x12
-                            PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
-                            PUSH1(0x60)
-                            MSTORE
-                            // G2_y11
-                            PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
-                            PUSH1(0x80)
-                            MSTORE
-                            // G2_y12
-                            PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
-                            PUSH1(0xA0)
-                            MSTORE
-                            // G1_x2
-                            PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
-                            PUSH1(0xC0)
-                            MSTORE
-                            // G1_y2
-                            PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
-                            PUSH1(0xE0)
-                            MSTORE
-                            // G2_x21
-                            PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
-                            PUSH2(0x100)
-                            MSTORE
-                            // G2_x22
-                            PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
-                            PUSH2(0x120)
-                            MSTORE
-                            // G2_y21
-                            PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
-                            PUSH2(0x140)
-                            MSTORE
-                            // G2_y22
-                            PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
-                            PUSH2(0x160)
-                            MSTORE
-                        };
-                        let mut memory_addr = 0x180;
-                        for _ in 0..2 {
-                            // G1::random
-                            let g1 = G1Affine::random(&mut rng);
-                            setup_code.push(32, Word::from_little_endian(&g1.x.to_bytes()));
+                    };
+                    let mut memory_addr = 0x180;
+                    for _ in 0..2 {
+                        // G1::random
+                        let g1 = G1Affine::random(&mut rng);
+                        setup_code.push(32, Word::from_little_endian(&g1.x.to_bytes()));
+                        setup_code.push(2, memory_addr);
+                        memory_addr += 0x20;
+                        setup_code.write_op(OpcodeId::MSTORE);
+                        setup_code.push(32, Word::from_little_endian(&g1.y.to_bytes()));
+                        setup_code.push(2, memory_addr);
+                        memory_addr += 0x20;
+                        setup_code.write_op(OpcodeId::MSTORE);
+                        // G2::identity
+                        for _ in 0..4 {
+                            setup_code.push(1, 0x00);
                             setup_code.push(2, memory_addr);
                             memory_addr += 0x20;
                             setup_code.write_op(OpcodeId::MSTORE);
-                            setup_code.push(32, Word::from_little_endian(&g1.y.to_bytes()));
+                        }
+                    }
+                    setup_code
+                },
+                call_data_offset: 0x00.into(),
+                call_data_length: 0x300.into(),
+                ret_offset: 0x300.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (pairing true): 4 pairs with random G2s",
+                setup_code: {
+                    let mut setup_code = bytecode! {
+                        // G1_x1
+                        PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18da"))
+                        PUSH1(0x00)
+                        MSTORE
+                        // G1_y1
+                        PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
+                        PUSH1(0x20)
+                        MSTORE
+                        // G2_x11
+                        PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
+                        PUSH1(0x40)
+                        MSTORE
+                        // G2_x12
+                        PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
+                        PUSH1(0x60)
+                        MSTORE
+                        // G2_y11
+                        PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
+                        PUSH1(0x80)
+                        MSTORE
+                        // G2_y12
+                        PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
+                        PUSH1(0xA0)
+                        MSTORE
+                        // G1_x2
+                        PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
+                        PUSH1(0xC0)
+                        MSTORE
+                        // G1_y2
+                        PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
+                        PUSH1(0xE0)
+                        MSTORE
+                        // G2_x21
+                        PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
+                        PUSH2(0x100)
+                        MSTORE
+                        // G2_x22
+                        PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
+                        PUSH2(0x120)
+                        MSTORE
+                        // G2_y21
+                        PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
+                        PUSH2(0x140)
+                        MSTORE
+                        // G2_y22
+                        PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
+                        PUSH2(0x160)
+                        MSTORE
+                    };
+                    let mut memory_addr = 0x180;
+                    for _ in 0..2 {
+                        // G1::identity
+                        for _ in 0..2 {
+                            setup_code.push(1, 0x00);
                             setup_code.push(2, memory_addr);
                             memory_addr += 0x20;
                             setup_code.write_op(OpcodeId::MSTORE);
-                            // G2::identity
-                            for _ in 0..4 {
-                                setup_code.push(1, 0x00);
-                                setup_code.push(2, memory_addr);
-                                memory_addr += 0x20;
-                                setup_code.write_op(OpcodeId::MSTORE);
-                            }
                         }
-                        setup_code
-                    },
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x300.into(),
-                    ret_offset: 0x300.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
-                },
-                PrecompileCallArgs {
-                    name: "ecPairing (pairing true): 4 pairs with random G2s",
-                    setup_code: {
-                        let mut setup_code = bytecode! {
-                            // G1_x1
-                            PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18da"))
-                            PUSH1(0x00)
-                            MSTORE
-                            // G1_y1
-                            PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
-                            PUSH1(0x20)
-                            MSTORE
-                            // G2_x11
-                            PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
-                            PUSH1(0x40)
-                            MSTORE
-                            // G2_x12
-                            PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
-                            PUSH1(0x60)
-                            MSTORE
-                            // G2_y11
-                            PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
-                            PUSH1(0x80)
-                            MSTORE
-                            // G2_y12
-                            PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
-                            PUSH1(0xA0)
-                            MSTORE
-                            // G1_x2
-                            PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
-                            PUSH1(0xC0)
-                            MSTORE
-                            // G1_y2
-                            PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
-                            PUSH1(0xE0)
-                            MSTORE
-                            // G2_x21
-                            PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
-                            PUSH2(0x100)
-                            MSTORE
-                            // G2_x22
-                            PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
-                            PUSH2(0x120)
-                            MSTORE
-                            // G2_y21
-                            PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
-                            PUSH2(0x140)
-                            MSTORE
-                            // G2_y22
-                            PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
-                            PUSH2(0x160)
-                            MSTORE
-                        };
-                        let mut memory_addr = 0x180;
-                        for _ in 0..2 {
-                            // G1::identity
-                            for _ in 0..2 {
-                                setup_code.push(1, 0x00);
-                                setup_code.push(2, memory_addr);
-                                memory_addr += 0x20;
-                                setup_code.write_op(OpcodeId::MSTORE);
-                            }
-                            // G2::random
-                            let g2 = G2Affine::random(&mut rng);
-                            for fq in [g2.x.c1, g2.x.c0, g2.y.c1, g2.y.c0].iter() {
-                                setup_code.push(32, Word::from_little_endian(&fq.to_bytes()));
-                                setup_code.push(2, memory_addr);
-                                memory_addr += 0x20;
-                                setup_code.write_op(OpcodeId::MSTORE);
-                            }
+                        // G2::random
+                        let g2 = G2Affine::random(&mut rng);
+                        for fq in [g2.x.c1, g2.x.c0, g2.y.c1, g2.y.c0].iter() {
+                            setup_code.push(32, Word::from_little_endian(&fq.to_bytes()));
+                            setup_code.push(2, memory_addr);
+                            memory_addr += 0x20;
+                            setup_code.write_op(OpcodeId::MSTORE);
                         }
-                        setup_code
-                    },
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x300.into(),
-                    ret_offset: 0x300.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
+                    }
+                    setup_code
                 },
-                #[cfg(feature = "scroll")]
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): len(input) > 768",
-                    setup_code: bytecode! {},
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 769.into(),
-                    ret_offset: 0xC0.into(),
-                    ret_size: 0x20.into(),
-                    value: 1.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x00.into(),
+                call_data_length: 0x300.into(),
+                ret_offset: 0x300.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            #[cfg(feature = "scroll")]
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): len(input) > 768",
+                setup_code: bytecode! {},
+                call_data_offset: 0x00.into(),
+                call_data_length: 769.into(),
+                ret_offset: 0xC0.into(),
+                ret_size: 0x20.into(),
+                value: 1.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): len(input) % 192 != 0",
+                setup_code: bytecode! {},
+                call_data_offset: 0x00.into(),
+                call_data_length: 191.into(),
+                ret_offset: 191.into(),
+                ret_size: 0x20.into(),
+                value: 1.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): len(input) % 192 != 0",
+                setup_code: bytecode! {},
+                call_data_offset: 0x00.into(),
+                call_data_length: 193.into(),
+                ret_offset: 193.into(),
+                ret_size: 0x20.into(),
+                value: 1.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): invalid field element, mod p is valid",
+                setup_code: bytecode! {
+                    // G1_x1
+                    PUSH32(word!("0x30644E72E131A029B85045B68181585D97816A916871CA8D3C208C16D87CFD48")) // p + 1
+                    PUSH1(0x00)
+                    MSTORE
+                    // G1_y1
+                    PUSH32(word!("0x30644E72E131A029B85045B68181585D97816A916871CA8D3C208C16D87CFD49")) // p + 2
+                    PUSH1(0x20)
+                    MSTORE
+                    // G2_x11
+                    PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
+                    PUSH1(0x40)
+                    MSTORE
+                    // G2_x12
+                    PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
+                    PUSH1(0x60)
+                    MSTORE
+                    // G2_y11
+                    PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
+                    PUSH1(0x80)
+                    MSTORE
+                    // G2_y12
+                    PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
+                    PUSH1(0xA0)
+                    MSTORE
+                    // G1_x2
+                    PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
+                    PUSH1(0xC0)
+                    MSTORE
+                    // G1_y2
+                    PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
+                    PUSH1(0xE0)
+                    MSTORE
+                    // G2_x21
+                    PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
+                    PUSH2(0x100)
+                    MSTORE
+                    // G2_x22
+                    PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
+                    PUSH2(0x120)
+                    MSTORE
+                    // G2_y21
+                    PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
+                    PUSH2(0x140)
+                    MSTORE
+                    // G2_y22
+                    PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
+                    PUSH2(0x160)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): len(input) % 192 != 0",
-                    setup_code: bytecode! {},
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 191.into(),
-                    ret_offset: 191.into(),
-                    ret_size: 0x20.into(),
-                    value: 1.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x00.into(),
+                call_data_length: 0x180.into(),
+                ret_offset: 0x180.into(),
+                ret_size: 0x20.into(),
+                value: 1.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): G1 point not on curve",
+                setup_code: bytecode! {
+                    // G1_x1
+                    PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18d0"))
+                    PUSH1(0x00)
+                    MSTORE
+                    // G1_y1
+                    PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
+                    PUSH1(0x20)
+                    MSTORE
+                    // G2_x11
+                    PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
+                    PUSH1(0x40)
+                    MSTORE
+                    // G2_x12
+                    PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
+                    PUSH1(0x60)
+                    MSTORE
+                    // G2_y11
+                    PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
+                    PUSH1(0x80)
+                    MSTORE
+                    // G2_y12
+                    PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
+                    PUSH1(0xA0)
+                    MSTORE
+                    // G1_x2
+                    PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
+                    PUSH1(0xC0)
+                    MSTORE
+                    // G1_y2
+                    PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
+                    PUSH1(0xE0)
+                    MSTORE
+                    // G2_x21
+                    PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
+                    PUSH2(0x100)
+                    MSTORE
+                    // G2_x22
+                    PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
+                    PUSH2(0x120)
+                    MSTORE
+                    // G2_y21
+                    PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
+                    PUSH2(0x140)
+                    MSTORE
+                    // G2_y22
+                    PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
+                    PUSH2(0x160)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): len(input) % 192 != 0",
-                    setup_code: bytecode! {},
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 193.into(),
-                    ret_offset: 193.into(),
-                    ret_size: 0x20.into(),
-                    value: 1.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x00.into(),
+                call_data_length: 0x180.into(),
+                ret_offset: 0x180.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): G2 point not on curve",
+                setup_code: bytecode! {
+                    // G1_x1
+                    PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18da"))
+                    PUSH1(0x00)
+                    MSTORE
+                    // G1_y1
+                    PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
+                    PUSH1(0x20)
+                    MSTORE
+                    // G2_x11
+                    PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebb"))
+                    PUSH1(0x40)
+                    MSTORE
+                    // G2_x12
+                    PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
+                    PUSH1(0x60)
+                    MSTORE
+                    // G2_y11
+                    PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
+                    PUSH1(0x80)
+                    MSTORE
+                    // G2_y12
+                    PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
+                    PUSH1(0xA0)
+                    MSTORE
+                    // G1_x2
+                    PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
+                    PUSH1(0xC0)
+                    MSTORE
+                    // G1_y2
+                    PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
+                    PUSH1(0xE0)
+                    MSTORE
+                    // G2_x21
+                    PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
+                    PUSH2(0x100)
+                    MSTORE
+                    // G2_x22
+                    PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
+                    PUSH2(0x120)
+                    MSTORE
+                    // G2_y21
+                    PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
+                    PUSH2(0x140)
+                    MSTORE
+                    // G2_y22
+                    PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
+                    PUSH2(0x160)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): invalid field element, mod p is valid",
-                    setup_code: bytecode! {
-                        // G1_x1
-                        PUSH32(word!("0x30644E72E131A029B85045B68181585D97816A916871CA8D3C208C16D87CFD48")) // p + 1
-                        PUSH1(0x00)
-                        MSTORE
-                        // G1_y1
-                        PUSH32(word!("0x30644E72E131A029B85045B68181585D97816A916871CA8D3C208C16D87CFD49")) // p + 2
-                        PUSH1(0x20)
-                        MSTORE
-                        // G2_x11
-                        PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
-                        PUSH1(0x40)
-                        MSTORE
-                        // G2_x12
-                        PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
-                        PUSH1(0x60)
-                        MSTORE
-                        // G2_y11
-                        PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
-                        PUSH1(0x80)
-                        MSTORE
-                        // G2_y12
-                        PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
-                        PUSH1(0xA0)
-                        MSTORE
-                        // G1_x2
-                        PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
-                        PUSH1(0xC0)
-                        MSTORE
-                        // G1_y2
-                        PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
-                        PUSH1(0xE0)
-                        MSTORE
-                        // G2_x21
-                        PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
-                        PUSH2(0x100)
-                        MSTORE
-                        // G2_x22
-                        PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
-                        PUSH2(0x120)
-                        MSTORE
-                        // G2_y21
-                        PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
-                        PUSH2(0x140)
-                        MSTORE
-                        // G2_y22
-                        PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
-                        PUSH2(0x160)
-                        MSTORE
-                    },
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x180.into(),
-                    ret_offset: 0x180.into(),
-                    ret_size: 0x20.into(),
-                    value: 1.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x00.into(),
+                call_data_length: 0x180.into(),
+                ret_offset: 0x180.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): G1: (0, 0), G2: not on curve",
+                setup_code: bytecode! {
+                    // G1_x
+                    PUSH32(0x00)
+                    PUSH1(0x00)
+                    MSTORE
+                    // G1_y
+                    PUSH32(0x00)
+                    PUSH1(0x20)
+                    MSTORE
+                    // G2_x1
+                    PUSH32(0x01)
+                    PUSH1(0x40)
+                    MSTORE
+                    // G2_x2
+                    PUSH32(0x02)
+                    PUSH1(0x60)
+                    MSTORE
+                    // G2_y1
+                    PUSH32(0x03)
+                    PUSH1(0x80)
+                    MSTORE
+                    // G2_y2
+                    PUSH32(0x04)
+                    PUSH1(0xA0)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): G1 point not on curve",
-                    setup_code: bytecode! {
-                        // G1_x1
-                        PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18d0"))
-                        PUSH1(0x00)
-                        MSTORE
-                        // G1_y1
-                        PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
-                        PUSH1(0x20)
-                        MSTORE
-                        // G2_x11
-                        PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
-                        PUSH1(0x40)
-                        MSTORE
-                        // G2_x12
-                        PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
-                        PUSH1(0x60)
-                        MSTORE
-                        // G2_y11
-                        PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
-                        PUSH1(0x80)
-                        MSTORE
-                        // G2_y12
-                        PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
-                        PUSH1(0xA0)
-                        MSTORE
-                        // G1_x2
-                        PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
-                        PUSH1(0xC0)
-                        MSTORE
-                        // G1_y2
-                        PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
-                        PUSH1(0xE0)
-                        MSTORE
-                        // G2_x21
-                        PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
-                        PUSH2(0x100)
-                        MSTORE
-                        // G2_x22
-                        PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
-                        PUSH2(0x120)
-                        MSTORE
-                        // G2_y21
-                        PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
-                        PUSH2(0x140)
-                        MSTORE
-                        // G2_y22
-                        PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
-                        PUSH2(0x160)
-                        MSTORE
-                    },
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x180.into(),
-                    ret_offset: 0x180.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x00.into(),
+                call_data_length: 0xC0.into(),
+                ret_offset: 0xC0.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): G1: not on curve, G2: (0, 0, 0, 0)",
+                setup_code: bytecode! {
+                    // G1_x
+                    PUSH32(0x04)
+                    PUSH1(0x00)
+                    MSTORE
+                    // G1_y
+                    PUSH32(0x04)
+                    PUSH1(0x20)
+                    MSTORE
+                    // G2_x1
+                    PUSH32(0x00)
+                    PUSH1(0x40)
+                    MSTORE
+                    // G2_x2
+                    PUSH32(0x00)
+                    PUSH1(0x60)
+                    MSTORE
+                    // G2_y1
+                    PUSH32(0x00)
+                    PUSH1(0x80)
+                    MSTORE
+                    // G2_y2
+                    PUSH32(0x00)
+                    PUSH1(0xA0)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): G2 point not on curve",
-                    setup_code: bytecode! {
-                        // G1_x1
-                        PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18da"))
-                        PUSH1(0x00)
-                        MSTORE
-                        // G1_y1
-                        PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
-                        PUSH1(0x20)
-                        MSTORE
-                        // G2_x11
-                        PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebb"))
-                        PUSH1(0x40)
-                        MSTORE
-                        // G2_x12
-                        PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
-                        PUSH1(0x60)
-                        MSTORE
-                        // G2_y11
-                        PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
-                        PUSH1(0x80)
-                        MSTORE
-                        // G2_y12
-                        PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
-                        PUSH1(0xA0)
-                        MSTORE
-                        // G1_x2
-                        PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
-                        PUSH1(0xC0)
-                        MSTORE
-                        // G1_y2
-                        PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
-                        PUSH1(0xE0)
-                        MSTORE
-                        // G2_x21
-                        PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
-                        PUSH2(0x100)
-                        MSTORE
-                        // G2_x22
-                        PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
-                        PUSH2(0x120)
-                        MSTORE
-                        // G2_y21
-                        PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
-                        PUSH2(0x140)
-                        MSTORE
-                        // G2_y22
-                        PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
-                        PUSH2(0x160)
-                        MSTORE
-                    },
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x180.into(),
-                    ret_offset: 0x180.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
-                },
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): G1: (0, 0), G2: not on curve",
-                    setup_code: bytecode! {
-                        // G1_x
-                        PUSH32(0x00)
-                        PUSH1(0x00)
-                        MSTORE
-                        // G1_y
-                        PUSH32(0x00)
-                        PUSH1(0x20)
-                        MSTORE
-                        // G2_x1
-                        PUSH32(0x01)
-                        PUSH1(0x40)
-                        MSTORE
-                        // G2_x2
-                        PUSH32(0x02)
-                        PUSH1(0x60)
-                        MSTORE
-                        // G2_y1
-                        PUSH32(0x03)
-                        PUSH1(0x80)
-                        MSTORE
-                        // G2_y2
-                        PUSH32(0x04)
-                        PUSH1(0xA0)
-                        MSTORE
-                    },
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0xC0.into(),
-                    ret_offset: 0xC0.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
-                },
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): G1: not on curve, G2: (0, 0, 0, 0)",
-                    setup_code: bytecode! {
-                        // G1_x
-                        PUSH32(0x04)
-                        PUSH1(0x00)
-                        MSTORE
-                        // G1_y
-                        PUSH32(0x04)
-                        PUSH1(0x20)
-                        MSTORE
-                        // G2_x1
-                        PUSH32(0x00)
-                        PUSH1(0x40)
-                        MSTORE
-                        // G2_x2
-                        PUSH32(0x00)
-                        PUSH1(0x60)
-                        MSTORE
-                        // G2_y1
-                        PUSH32(0x00)
-                        PUSH1(0x80)
-                        MSTORE
-                        // G2_y2
-                        PUSH32(0x00)
-                        PUSH1(0xA0)
-                        MSTORE
-                    },
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0xC0.into(),
-                    ret_offset: 0xC0.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    ..Default::default()
-                },
-            ]
-        };
-        static ref OOG_TEST_VECTOR: Vec<PrecompileCallArgs> = {
-            vec![
-                PrecompileCallArgs {
-                    name: "ecPairing (pairing true): 2 pairs",
-                    setup_code: bytecode! {
-                        // G1_x1
-                        PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18da"))
-                        PUSH1(0x00)
-                        MSTORE
-                        // G1_y1
-                        PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
-                        PUSH1(0x20)
-                        MSTORE
-                        // G2_x11
-                        PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
-                        PUSH1(0x40)
-                        MSTORE
-                        // G2_x12
-                        PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
-                        PUSH1(0x60)
-                        MSTORE
-                        // G2_y11
-                        PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
-                        PUSH1(0x80)
-                        MSTORE
-                        // G2_y12
-                        PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
-                        PUSH1(0xA0)
-                        MSTORE
-                        // G1_x2
-                        PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
-                        PUSH1(0xC0)
-                        MSTORE
-                        // G1_y2
-                        PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
-                        PUSH1(0xE0)
-                        MSTORE
-                        // G2_x21
-                        PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
-                        PUSH2(0x100)
-                        MSTORE
-                        // G2_x22
-                        PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
-                        PUSH2(0x120)
-                        MSTORE
-                        // G2_y21
-                        PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
-                        PUSH2(0x140)
-                        MSTORE
-                        // G2_y22
-                        PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
-                        PUSH2(0x160)
-                        MSTORE
-                    },
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x180.into(),
-                    ret_offset: 0x180.into(),
-                    ret_size: 0x20.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    value: 1.into(),
-                    gas: (PrecompileCalls::Bn128Pairing.base_gas_cost().as_u64()
-                        + 2* GasCost::PRECOMPILE_BN256PAIRING_PER_PAIR.as_u64() - 1).to_word(),
-                    ..Default::default()
-                },
-            ]
-        };
-        static ref INVALID_LEN_TEST: Vec<PrecompileCallArgs> = {
-            vec![
-                #[cfg(feature = "scroll")]
-                PrecompileCallArgs {
-                    name: "ecPairing (invalid): len(input) > 768",
-                    setup_code: bytecode! {},
-                    call_data_offset: 0x00.into(),
-                    call_data_length: 0x10340.into(),
-                    ret_offset: 0xC0.into(),
-                    ret_size: 0x20.into(),
-                    value: 1.into(),
-                    address: PrecompileCalls::Bn128Pairing.address().to_word(),
-                    gas: 12_000_000.into(),
-                    ..Default::default()
-                },
-            ]
-        };
-    }
+                call_data_offset: 0x00.into(),
+                call_data_length: 0xC0.into(),
+                ret_offset: 0xC0.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                ..Default::default()
+            },
+        ]
+    });
+
+    static OOG_TEST_VECTOR: LazyLock<Vec<PrecompileCallArgs>> = LazyLock::new(|| {
+        vec![PrecompileCallArgs {
+            name: "ecPairing (pairing true): 2 pairs",
+            setup_code: bytecode! {
+                // G1_x1
+                PUSH32(word!("0x2cf44499d5d27bb186308b7af7af02ac5bc9eeb6a3d147c186b21fb1b76e18da"))
+                PUSH1(0x00)
+                MSTORE
+                // G1_y1
+                PUSH32(word!("0x2c0f001f52110ccfe69108924926e45f0b0c868df0e7bde1fe16d3242dc715f6"))
+                PUSH1(0x20)
+                MSTORE
+                // G2_x11
+                PUSH32(word!("0x1fb19bb476f6b9e44e2a32234da8212f61cd63919354bc06aef31e3cfaff3ebc"))
+                PUSH1(0x40)
+                MSTORE
+                // G2_x12
+                PUSH32(word!("0x22606845ff186793914e03e21df544c34ffe2f2f3504de8a79d9159eca2d98d9"))
+                PUSH1(0x60)
+                MSTORE
+                // G2_y11
+                PUSH32(word!("0x2bd368e28381e8eccb5fa81fc26cf3f048eea9abfdd85d7ed3ab3698d63e4f90"))
+                PUSH1(0x80)
+                MSTORE
+                // G2_y12
+                PUSH32(word!("0x2fe02e47887507adf0ff1743cbac6ba291e66f59be6bd763950bb16041a0a85e"))
+                PUSH1(0xA0)
+                MSTORE
+                // G1_x2
+                PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000001"))
+                PUSH1(0xC0)
+                MSTORE
+                // G1_y2
+                PUSH32(word!("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45"))
+                PUSH1(0xE0)
+                MSTORE
+                // G2_x21
+                PUSH32(word!("0x1971ff0471b09fa93caaf13cbf443c1aede09cc4328f5a62aad45f40ec133eb4"))
+                PUSH2(0x100)
+                MSTORE
+                // G2_x22
+                PUSH32(word!("0x091058a3141822985733cbdddfed0fd8d6c104e9e9eff40bf5abfef9ab163bc7"))
+                PUSH2(0x120)
+                MSTORE
+                // G2_y21
+                PUSH32(word!("0x2a23af9a5ce2ba2796c1f4e453a370eb0af8c212d9dc9acd8fc02c2e907baea2"))
+                PUSH2(0x140)
+                MSTORE
+                // G2_y22
+                PUSH32(word!("0x23a8eb0b0996252cb548a4487da97b02422ebc0e834613f954de6c7e0afdc1fc"))
+                PUSH2(0x160)
+                MSTORE
+            },
+            call_data_offset: 0x00.into(),
+            call_data_length: 0x180.into(),
+            ret_offset: 0x180.into(),
+            ret_size: 0x20.into(),
+            address: PrecompileCalls::Bn128Pairing.address().to_word(),
+            value: 1.into(),
+            gas: (PrecompileCalls::Bn128Pairing.base_gas_cost().as_u64()
+                + 2 * GasCost::PRECOMPILE_BN256PAIRING_PER_PAIR.as_u64()
+                - 1)
+            .to_word(),
+            ..Default::default()
+        }]
+    });
+
+    static INVALID_LEN_TEST: LazyLock<Vec<PrecompileCallArgs>> = LazyLock::new(|| {
+        vec![
+            #[cfg(feature = "scroll")]
+            PrecompileCallArgs {
+                name: "ecPairing (invalid): len(input) > 768",
+                setup_code: bytecode! {},
+                call_data_offset: 0x00.into(),
+                call_data_length: 0x10340.into(),
+                ret_offset: 0xC0.into(),
+                ret_size: 0x20.into(),
+                value: 1.into(),
+                address: PrecompileCalls::Bn128Pairing.address().to_word(),
+                gas: 12_000_000.into(),
+                ..Default::default()
+            },
+        ]
+    });
 
     #[test]
     fn precompile_ec_pairing_test() {

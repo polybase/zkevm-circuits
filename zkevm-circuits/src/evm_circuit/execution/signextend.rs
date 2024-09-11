@@ -15,11 +15,11 @@ use crate::{
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{Expr, Field},
 };
 use array_init::array_init;
 use bus_mapping::evm::OpcodeId;
-use eth_types::{Field, ToLittleEndian};
+use eth_types::ToLittleEndian;
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 #[derive(Clone, Debug)]
@@ -158,12 +158,13 @@ impl<F: Field> ExecutionGadget<F> for SignextendGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         // Inputs/Outputs
         let index = block.rws[step.rw_indices[0]].stack_value().to_le_bytes();
@@ -279,7 +280,7 @@ mod test {
         let pos_extend = 0u8;
         let neg_extend = 0xFFu8;
 
-        for (value, byte_extend) in vec![(pos_value, pos_extend), (neg_value, neg_extend)].iter() {
+        for (value, byte_extend) in [(pos_value, pos_extend), (neg_value, neg_extend)].iter() {
             for idx in 0..33 {
                 test_ok(
                     (idx as u64).into(),

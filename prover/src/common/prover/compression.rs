@@ -10,7 +10,7 @@ use rand::Rng;
 use snark_verifier_sdk::Snark;
 use std::env;
 
-impl Prover {
+impl<'params> Prover<'params> {
     pub fn gen_comp_snark(
         &mut self,
         id: &str,
@@ -24,8 +24,7 @@ impl Prover {
         let circuit =
             CompressionCircuit::new(self.params(degree), prev_snark, has_accumulator, &mut rng)
                 .map_err(|err| anyhow!("Failed to construct compression circuit: {err:?}"))?;
-
-        self.gen_snark(id, degree, &mut rng, circuit)
+        self.gen_snark(id, degree, &mut rng, circuit, "gen_comp_snark")
     }
 
     pub fn load_or_gen_comp_snark(

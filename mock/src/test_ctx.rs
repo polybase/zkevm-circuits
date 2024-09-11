@@ -1,10 +1,11 @@
-//! Mock types and functions to generate Test enviroments for ZKEVM tests
+//! Mock types and functions to generate Test environments for ZKEVM tests
 
 use crate::{eth, MockAccount, MockBlock, MockTransaction, MOCK_WALLETS};
 #[cfg(feature = "scroll")]
 use eth_types::l2_types::BlockTrace;
 use eth_types::{
     geth_types::{Account, BlockConstants, GethData},
+    l2_predeployed::l1_gas_price_oracle,
     BigEndianHash, Block, Bytecode, Error, Transaction, Word, H256,
 };
 #[cfg(feature = "scroll")]
@@ -33,7 +34,6 @@ pub use external_tracer::LoggerConfig;
 /// ```rust
 /// use eth_types::evm_types::{stack::Stack, Gas, OpcodeId};
 /// use eth_types::{address, bytecode, geth_types::GethData, word, Bytecode, ToWord, Word};
-/// use lazy_static::lazy_static;
 /// use mock::test_ctx::{helpers::*, TestContext};
 /// // code_a calls code
 /// // jump to 0x10 which is outside the code (and also not marked with
@@ -89,15 +89,22 @@ pub struct TestContext<const NACC: usize, const NTX: usize> {
     /// Account list
     pub accounts: [Account; NACC],
     /// history hashes contains most recent 256 block hashes in history, where
-    /// the lastest one is at history_hashes[history_hashes.len() - 1].
+    /// the latest one is at history_hashes[history_hashes.len() - 1].
     pub history_hashes: Vec<Word>,
     /// Block from geth
     pub eth_block: eth_types::Block<eth_types::Transaction>,
     /// Execution Trace from geth
     pub geth_traces: Vec<eth_types::GethExecTrace>,
-
     #[cfg(feature = "scroll")]
     block_trace: BlockTrace,
+}
+
+fn deployed_system_contract_for_test_env() -> Vec<Account> {
+    if cfg!(feature = "scroll") {
+        vec![l1_gas_price_oracle::default_contract_account()]
+    } else {
+        vec![]
+    }
 }
 
 impl<const NACC: usize, const NTX: usize> From<TestContext<NACC, NTX>> for GethData {
@@ -107,7 +114,16 @@ impl<const NACC: usize, const NTX: usize> From<TestContext<NACC, NTX>> for GethD
             history_hashes: ctx.history_hashes,
             eth_block: ctx.eth_block,
             geth_traces: ctx.geth_traces.to_vec(),
-            accounts: ctx.accounts.into(),
+            // TODO: any better method?
+            // always inject system contract
+            accounts: ctx
+                .accounts
+                .iter()
+                .cloned()
+                .chain(deployed_system_contract_for_test_env())
+                .collect_vec(),
+            #[cfg(feature = "scroll")]
+            block_trace: ctx.block_trace,
         }
     }
 }
@@ -185,7 +201,11 @@ impl<const NACC: usize, const NTX: usize> TestContext<NACC, NTX> {
         let trace_config = gen_trace_config(
             chain_id,
             block.clone(),
-            accounts.to_vec(),
+            accounts
+                .iter()
+                .cloned()
+                .chain(deployed_system_contract_for_test_env())
+                .collect_vec(),
             history_hashes.clone(),
             logger_config,
         )?;
@@ -287,9 +307,6 @@ pub fn gen_trace_config(
             .map(eth_types::geth_types::Transaction::from)
             .collect(),
         logger_config,
-        #[cfg(feature = "shanghai")]
-        chain_config: Some(external_tracer::ChainConfig::shanghai()),
-        #[cfg(not(feature = "shanghai"))]
         chain_config: None,
         #[cfg(feature = "scroll")]
         l1_queue_index: 0,

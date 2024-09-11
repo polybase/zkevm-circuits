@@ -3,7 +3,7 @@ use crate::{
         param::{N_BYTES_ACCOUNT_ADDRESS, N_BYTES_MEMORY_WORD_SIZE, N_BYTES_U64},
         step::ExecutionState,
         util::{
-            common_gadget::{SameContextGadget, WordByteCapGadget},
+            common_gadget::{BytecodeLengthGadget, SameContextGadget, WordByteCapGadget},
             constraint_builder::{
                 ConstrainBuilderCommon, EVMConstraintBuilder, ReversionInfo, StepStateTransition,
                 Transition,
@@ -19,10 +19,12 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::{AccountFieldTag, CallContextFieldTag},
+    util::Field,
 };
 use bus_mapping::circuit_input_builder::CopyDataType;
-use eth_types::{evm_types::GasCost, Field, ToLittleEndian, ToScalar};
+use eth_types::{evm_types::GasCost, ToLittleEndian};
 use gadgets::util::Expr;
+use gadgets::ToScalar;
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 use super::ExecutionGadget;
@@ -38,7 +40,7 @@ pub(crate) struct ExtcodecopyGadget<F> {
     is_warm: Cell<F>,
     code_hash: Cell<F>,
     not_exists: IsZeroGadget<F>,
-    code_size: Cell<F>,
+    code_len_gadget: BytecodeLengthGadget<F>,
     copy_rwc_inc: Cell<F>,
     memory_expansion: MemoryExpansionGadget<F, 1, N_BYTES_MEMORY_WORD_SIZE>,
     memory_copier_gas: MemoryCopierGasGadget<F, { GasCost::COPY }>,
@@ -56,12 +58,18 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
         let external_address =
             from_bytes::expr(&external_address_word.cells[..N_BYTES_ACCOUNT_ADDRESS]);
 
-        let code_size = cb.query_cell();
-
         let memory_length = cb.query_word_rlc();
         let memory_offset = cb.query_cell_phase2();
-        let code_offset = WordByteCapGadget::construct(cb, code_size.expr());
 
+        let code_hash = cb.query_cell_phase2();
+        let not_exists = IsZeroGadget::construct(cb, code_hash.clone().expr());
+        let exists = not::expr(not_exists.expr());
+
+        let code_len_gadget = cb.condition(exists.expr(), |cb| {
+            BytecodeLengthGadget::construct(cb, code_hash.clone())
+        });
+
+        let code_offset = WordByteCapGadget::construct(cb, code_len_gadget.code_length.expr());
         cb.stack_pop(external_address_word.expr());
         cb.stack_pop(memory_offset.expr());
         cb.stack_pop(code_offset.original_word());
@@ -78,19 +86,17 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
             Some(&mut reversion_info),
         );
 
-        let code_hash = cb.query_cell_phase2();
         cb.account_read(
             external_address.expr(),
             AccountFieldTag::CodeHash,
             code_hash.expr(),
         );
-        let not_exists = IsZeroGadget::construct(cb, code_hash.expr());
-        let exists = not::expr(not_exists.expr());
-        cb.condition(exists.expr(), |cb| {
-            cb.bytecode_length(code_hash.expr(), code_size.expr());
-        });
+
         cb.condition(not_exists.expr(), |cb| {
-            cb.require_zero("code_size is zero when non_exists", code_size.expr());
+            cb.require_zero(
+                "code_size is zero when non_exists",
+                code_len_gadget.code_length.expr(),
+            );
         });
 
         let memory_address = MemoryAddressGadget::construct(cb, memory_offset, memory_length);
@@ -109,11 +115,11 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
 
         let copy_rwc_inc = cb.query_cell();
         cb.condition(memory_address.has_length(), |cb| {
-            // Set source start to the minimun value of code offset and code size.
+            // Set source start to the minimum value of code offset and code size.
             let src_addr = select::expr(
                 code_offset.lt_cap(),
                 code_offset.valid_value(),
-                code_size.expr(),
+                code_len_gadget.code_length.expr(),
             );
 
             cb.copy_table_lookup(
@@ -122,7 +128,7 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
                 cb.curr.state.call_id.expr(),
                 CopyDataType::Memory.expr(),
                 src_addr,
-                code_size.expr(),
+                code_len_gadget.code_length.expr(),
                 memory_address.offset(),
                 memory_address.length(),
                 0.expr(),
@@ -153,11 +159,11 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
             memory_address,
             code_offset,
             tx_id,
-            is_warm,
             reversion_info,
+            is_warm,
             code_hash,
             not_exists,
-            code_size,
+            code_len_gadget,
             copy_rwc_inc,
             memory_expansion,
             memory_copier_gas,
@@ -168,12 +174,13 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         transaction: &Transaction,
         call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         let [external_address, memory_offset, code_offset, memory_length] =
             [0, 1, 2, 3].map(|idx| block.rws[step.rw_indices[idx]].stack_value());
@@ -202,18 +209,9 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
         self.not_exists
             .assign_value(region, offset, region.code_hash(code_hash))?;
 
-        let code_size = if code_hash.is_zero() {
-            0
-        } else {
-            block
-                .bytecodes
-                .get(&code_hash)
-                .expect("could not find external bytecode")
-                .bytes
-                .len() as u64
-        };
-        self.code_size
-            .assign(region, offset, Value::known(F::from(code_size)))?;
+        let code_size = self
+            .code_len_gadget
+            .assign(region, offset, block, &code_hash)?;
 
         self.code_offset
             .assign(region, offset, code_offset, F::from(code_size))?;
@@ -253,13 +251,11 @@ mod test {
     use eth_types::{
         address, bytecode, geth_types::Account, Address, Bytecode, Bytes, ToWord, Word,
     };
-    use lazy_static::lazy_static;
     use mock::TestContext;
+    use std::sync::LazyLock;
 
-    lazy_static! {
-        static ref EXTERNAL_ADDRESS: Address =
-            address!("0xaabbccddee000000000000000000000000000000");
-    }
+    static EXTERNAL_ADDRESS: LazyLock<Address> =
+        LazyLock::new(|| address!("0xaabbccddee000000000000000000000000000000"));
 
     fn test_ok(
         external_account: Option<Account>,

@@ -11,14 +11,17 @@ mod test;
 #[cfg(any(feature = "test", test, feature = "test-circuits"))]
 pub use dev::CopyCircuit as TestCopyCircuit;
 
+use crate::util::Field;
+use array_init::array_init;
 use bus_mapping::circuit_input_builder::{CopyDataType, CopyEvent};
-use eth_types::{Field, Word};
-
+use eth_types::Word;
 use gadgets::{
     binary_number::BinaryNumberChip,
     is_equal::{IsEqualChip, IsEqualConfig, IsEqualInstruction},
-    util::{not, Expr},
+    util::{not, select, Expr},
 };
+
+use crate::copy_circuit::util::number_or_hash_to_field;
 use halo2_proofs::{
     circuit::{Layouter, Region, Value},
     plonk::{Advice, Column, ConstraintSystem, Error, Expression, Fixed, Selector},
@@ -45,8 +48,9 @@ use crate::{
 
 use self::copy_gadgets::{
     constrain_address, constrain_bytes_left, constrain_event_rlc_acc, constrain_first_last,
-    constrain_forward_parameters, constrain_is_pad, constrain_mask, constrain_masked_value,
-    constrain_must_terminate, constrain_non_pad_non_mask, constrain_rw_counter, constrain_tag,
+    constrain_forward_parameters, constrain_is_first_bytecode_table, constrain_is_memory_copy,
+    constrain_is_pad, constrain_mask, constrain_masked_value, constrain_must_terminate,
+    constrain_non_pad_non_mask, constrain_rw_counter, constrain_rw_word_complete, constrain_tag,
     constrain_value_rlc, constrain_word_index, constrain_word_rlc,
 };
 
@@ -95,19 +99,32 @@ pub struct CopyCircuitConfig<F> {
     pub is_bytecode: Column<Advice>,
     /// Booleans to indicate what copy data type exists at the current row.
     pub is_memory: Column<Advice>,
+    /// Booleans to indicate if mcopy data type exists at the current row.
+    pub is_memory_copy: Column<Advice>,
     /// Booleans to indicate what copy data type exists at the current row.
     pub is_tx_log: Column<Advice>,
+    /// Booleans to indicate if `CopyDataType::AccessListAddresses` exists at
+    /// the current row.
+    pub is_access_list_address: Column<Advice>,
+    /// Booleans to indicate if `CopyDataType::AccessListStorageKeys` exists at
+    /// the current row.
+    pub is_access_list_storage_key: Column<Advice>,
     /// Whether the row is enabled or not.
     pub q_enable: Column<Fixed>,
     /// The Copy Table contains the columns that are exposed via the lookup
     /// expressions
     pub copy_table: CopyTable,
+    /// Detect if copy src_id equals dst_id for current row and next row.
+    pub is_id_unchange: IsEqualConfig<F>,
     /// Detect when the address reaches the limit src_addr_end.
     pub is_src_end: IsEqualConfig<F>,
     /// Whether this is the end of a word (last byte).
     pub is_word_end: IsEqualConfig<F>,
     /// non pad and non mask witness to reduce the degree of lookups.
     pub non_pad_non_mask: Column<Advice>,
+    #[cfg(feature = "dual-bytecode")]
+    /// Whether the bytecode is belong to the first bytecode sub circuit .
+    pub is_first_bytecode_table: Column<Advice>,
     // External tables
     /// TxTable
     pub tx_table: TxTable,
@@ -115,6 +132,9 @@ pub struct CopyCircuitConfig<F> {
     pub rw_table: RwTable,
     /// BytecodeTable
     pub bytecode_table: BytecodeTable,
+    #[cfg(feature = "dual-bytecode")]
+    /// BytecodeTable1
+    pub bytecode_table1: BytecodeTable,
 }
 
 /// Circuit configuration arguments
@@ -125,6 +145,9 @@ pub struct CopyCircuitConfigArgs<F: Field> {
     pub rw_table: RwTable,
     /// BytecodeTable
     pub bytecode_table: BytecodeTable,
+    #[cfg(feature = "dual-bytecode")]
+    /// BytecodeTable1
+    pub bytecode_table1: BytecodeTable,
     /// CopyTable
     pub copy_table: CopyTable,
     /// q_enable
@@ -144,6 +167,8 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
             tx_table,
             rw_table,
             bytecode_table,
+            #[cfg(feature = "dual-bytecode")]
+            bytecode_table1,
             copy_table,
             q_enable,
             challenges,
@@ -159,14 +184,11 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
         let value_word_rlc_prev = meta.advice_column_in(SecondPhase);
         let value_acc = meta.advice_column_in(SecondPhase);
 
-        let (is_tx_calldata, is_bytecode, is_memory, is_tx_log) = (
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-        );
-        let is_pad = meta.advice_column();
+        let [is_pad, is_tx_calldata, is_bytecode, is_memory, is_memory_copy, is_tx_log, is_access_list_address, is_access_list_storage_key] =
+            array_init(|_| meta.advice_column());
         let is_first = copy_table.is_first;
+        #[cfg(feature = "dual-bytecode")]
+        let is_first_bytecode_table = meta.advice_column();
         let id = copy_table.id;
         let addr = copy_table.addr;
         let src_addr_end = copy_table.src_addr_end;
@@ -184,7 +206,18 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
         tx_table.annotate_columns(meta);
         rw_table.annotate_columns(meta);
         bytecode_table.annotate_columns(meta);
+        #[cfg(feature = "dual-bytecode")]
+        bytecode_table1.annotate_columns(meta);
+
         copy_table.annotate_columns(meta);
+
+        let is_id_unchange = IsEqualChip::configure_with_value_inv(
+            meta,
+            |meta| meta.query_selector(q_step) * not::expr(meta.query_advice(is_last, CURRENT)),
+            |meta| meta.query_advice(id, CURRENT),
+            |meta| meta.query_advice(id, NEXT_ROW),
+            |meta| meta.advice_column_in(SecondPhase),
+        );
 
         let is_src_end = IsEqualChip::configure(
             meta,
@@ -210,6 +243,8 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
             is_bytecode,
             is_memory,
             is_tx_log,
+            is_access_list_address,
+            is_access_list_storage_key,
         );
 
         meta.create_gate("verify copy events", |meta| {
@@ -233,6 +268,8 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
             // NEXT_STEP.
             let is_word_end = is_word_end.expr();
             let is_tx_log = meta.query_advice(is_tx_log, CURRENT);
+            let is_access_list = meta.query_advice(is_access_list_address, CURRENT)
+                + meta.query_advice(is_access_list_storage_key, CURRENT);
 
             constrain_first_last(cb, is_reader.expr(), is_first.expr(), is_last.expr());
 
@@ -254,8 +291,9 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
 
             let (mask, mask_next, front_mask) = {
                 // The first 31 bytes may be front_mask, but not the last byte of the first word.
-                // LOG has no front mask at all.
-                let forbid_front_mask = is_word_end.expr() + is_tx_log.expr();
+                // LOG, access-list address and storage-key have no front mask at all.
+                let forbid_front_mask =
+                    is_word_end.expr() + is_tx_log.expr() + is_access_list.expr();
 
                 constrain_mask(
                     cb,
@@ -294,8 +332,11 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
                 constrain_word_rlc(
                     cb,
                     meta,
-                    is_first.expr(),
-                    is_continue.expr(),
+                    // Not constrain word rlc for access list, since `value`
+                    // saves access list address and `value_prev` saves storage
+                    // key.
+                    is_first.expr() * (1.expr() - is_access_list.expr()),
+                    is_continue.expr() * (1.expr() - is_access_list.expr()),
                     is_word_end.expr(),
                     word_rlc,
                     value,
@@ -324,25 +365,51 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
             constrain_address(cb, meta, is_continue.expr(), front_mask.expr(), addr);
 
             {
-                let is_rw_type = meta.query_advice(is_memory, CURRENT) + is_tx_log.expr();
+                let is_rw_word_type = meta.query_advice(is_memory, CURRENT) + is_tx_log.expr();
+                let is_rw_type = is_rw_word_type.expr() + is_access_list.expr();
+
+                // No word align for access list address and storage key.
+                let is_row_end = select::expr(
+                    is_access_list.expr(),
+                    not::expr(is_reader),
+                    is_word_end.expr(),
+                );
+
+                let is_memory_copy = meta.query_advice(is_memory_copy, CURRENT);
 
                 constrain_rw_counter(
                     cb,
                     meta,
-                    is_last.expr(),
-                    is_last_step.expr(),
+                    is_last_col,
+                    is_first,
                     is_rw_type.expr(),
-                    is_word_end.expr(),
+                    is_row_end.expr(),
+                    is_memory_copy.expr(),
                     rw_counter,
                     rwc_inc_left,
                 );
+
+                // constrain is_memory_copy = src_id == dst_id && src_type == dst_type ==
+                // memory
+                constrain_is_memory_copy(
+                    cb,
+                    meta,
+                    is_last_col,
+                    &is_id_unchange,
+                    is_memory,
+                    is_memory_copy,
+                );
+                constrain_rw_word_complete(cb, is_last_step, is_rw_word_type.expr(), is_word_end);
+
+                #[cfg(feature = "dual-bytecode")]
+                constrain_is_first_bytecode_table(cb, meta, is_first_bytecode_table, is_last_col);
             }
 
             cb.gate(meta.query_fixed(q_enable, CURRENT))
         });
 
         // memory word lookup
-        meta.lookup_any("Memory word lookup", |meta| {
+        meta.lookup_any("rw lookup", |meta| {
             let cond = meta.query_fixed(q_enable, CURRENT)
                 * meta.query_advice(is_memory, CURRENT)
                 * is_word_end.is_equal_expression.expr();
@@ -364,7 +431,7 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
                 0.expr(),
             ]
             .into_iter()
-            .zip(rw_table.table_exprs(meta).into_iter())
+            .zip(rw_table.table_exprs(meta))
             .map(|(arg, table)| (cond.clone() * arg, table))
             .collect()
         });
@@ -391,15 +458,26 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
                 0.expr(),
             ]
             .into_iter()
-            .zip(rw_table.table_exprs(meta).into_iter())
+            .zip(rw_table.table_exprs(meta))
             .map(|(arg, table)| (cond.clone() * arg, table))
             .collect()
         });
 
+        // lookup first bytecode table
         meta.lookup_any("Bytecode lookup", |meta| {
-            let cond = meta.query_fixed(q_enable, CURRENT)
+            #[cfg(feature = "dual-bytecode")]
+            let is_first_bytecode = meta.query_advice(is_first_bytecode_table, CURRENT);
+
+            let mut cond = meta.query_fixed(q_enable, CURRENT)
                 * meta.query_advice(is_bytecode, CURRENT)
                 * meta.query_advice(non_pad_non_mask, CURRENT);
+
+            #[cfg(feature = "dual-bytecode")]
+            {
+                cond = cond * is_first_bytecode.expr();
+            }
+
+            let table_expr = bytecode_table.table_exprs_mini(meta);
 
             vec![
                 1.expr(),
@@ -409,12 +487,37 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
                 meta.query_advice(value, CURRENT),
             ]
             .into_iter()
-            .zip_eq(bytecode_table.table_exprs_mini(meta).into_iter())
+            .zip_eq(table_expr)
             .map(|(arg, table)| (cond.clone() * arg, table))
             .collect()
         });
 
-        meta.lookup_any("Tx calldata lookup", |meta| {
+        // lookup second bytecode table
+        #[cfg(feature = "dual-bytecode")]
+        meta.lookup_any("Bytecode1 lookup", |meta| {
+            let is_first_bytecode = meta.query_advice(is_first_bytecode_table, CURRENT);
+
+            let cond = meta.query_fixed(q_enable, CURRENT)
+                * meta.query_advice(is_bytecode, CURRENT)
+                * meta.query_advice(non_pad_non_mask, CURRENT)
+                * (1.expr() - is_first_bytecode);
+
+            let table_expr = bytecode_table1.table_exprs_mini(meta);
+
+            vec![
+                1.expr(),
+                meta.query_advice(id, CURRENT),
+                BytecodeFieldTag::Byte.expr(),
+                meta.query_advice(addr, CURRENT),
+                meta.query_advice(value, CURRENT),
+            ]
+            .into_iter()
+            .zip_eq(table_expr)
+            .map(|(arg, table)| (cond.clone() * arg, table))
+            .collect()
+        });
+
+        meta.lookup_any("tx lookup for CallData", |meta| {
             let cond = meta.query_fixed(q_enable, CURRENT)
                 * meta.query_advice(is_tx_calldata, CURRENT)
                 * meta.query_advice(non_pad_non_mask, CURRENT);
@@ -427,7 +530,106 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
                 meta.query_advice(value, CURRENT),
             ]
             .into_iter()
-            .zip(tx_table.table_exprs(meta).into_iter())
+            .zip(tx_table.table_exprs(meta))
+            .map(|(arg, table)| (cond.clone() * arg, table))
+            .collect()
+        });
+
+        meta.lookup_any("Tx access list address lookup", |meta| {
+            let cond = meta.query_fixed(q_enable, CURRENT)
+                * meta.query_advice(is_access_list_address, CURRENT);
+
+            let tx_id = meta.query_advice(id, CURRENT);
+            let index = meta.query_advice(addr, CURRENT);
+            let address = meta.query_advice(value_word_rlc, CURRENT);
+
+            vec![
+                1.expr(),
+                tx_id,
+                TxContextFieldTag::AccessListAddress.expr(),
+                index,
+                address,
+            ]
+            .into_iter()
+            .zip(tx_table.table_exprs(meta))
+            .map(|(arg, table)| (cond.clone() * arg, table))
+            .collect()
+        });
+
+        meta.lookup_any("Rw access list address lookup", |meta| {
+            let cond = meta.query_fixed(q_enable, CURRENT)
+                * meta.query_advice(is_access_list_address, CURRENT);
+
+            let tx_id = meta.query_advice(id, CURRENT);
+            let address = meta.query_advice(value_word_rlc, CURRENT);
+            let is_warm_prev = meta.query_advice(value_prev, CURRENT);
+
+            vec![
+                1.expr(),
+                meta.query_advice(rw_counter, CURRENT),
+                1.expr(),
+                RwTableTag::TxAccessListAccount.expr(),
+                tx_id,
+                address, // access list address
+                0.expr(),
+                0.expr(),
+                1.expr(),     // is_warm
+                is_warm_prev, // is_warm_prev
+                0.expr(),
+                0.expr(),
+            ]
+            .into_iter()
+            .zip(rw_table.table_exprs(meta))
+            .map(|(arg, table)| (cond.clone() * arg, table))
+            .collect()
+        });
+
+        meta.lookup_any("Tx access list storage key lookup", |meta| {
+            let cond = meta.query_fixed(q_enable, CURRENT)
+                * meta.query_advice(is_access_list_storage_key, CURRENT);
+
+            let tx_id = meta.query_advice(id, CURRENT);
+            let index = meta.query_advice(value, CURRENT);
+            let storage_key = meta.query_advice(value_word_rlc_prev, CURRENT);
+
+            vec![
+                1.expr(),
+                tx_id,
+                TxContextFieldTag::AccessListStorageKey.expr(),
+                index,
+                storage_key,
+            ]
+            .into_iter()
+            .zip(tx_table.table_exprs(meta))
+            .map(|(arg, table)| (cond.clone() * arg, table))
+            .collect()
+        });
+
+        meta.lookup_any("Rw access list storage key lookup", |meta| {
+            let cond = meta.query_fixed(q_enable, CURRENT)
+                * meta.query_advice(is_access_list_storage_key, CURRENT);
+
+            let tx_id = meta.query_advice(id, CURRENT);
+            let address = meta.query_advice(value_word_rlc, CURRENT);
+            let storage_key = meta.query_advice(value_word_rlc_prev, CURRENT);
+            let is_warm_prev = meta.query_advice(value_prev, CURRENT);
+
+            vec![
+                1.expr(),
+                meta.query_advice(rw_counter, CURRENT),
+                1.expr(),
+                RwTableTag::TxAccessListAccountStorage.expr(),
+                tx_id,
+                address, // access list address
+                0.expr(),
+                storage_key,  // access list storage key
+                1.expr(),     // is_warm
+                is_warm_prev, // is_warm_prev
+                0.expr(),
+                0.expr(),
+            ]
+            .into_iter()
+            .zip(rw_table.table_exprs(meta))
             .map(|(arg, table)| (cond.clone() * arg, table))
             .collect()
         });
@@ -447,15 +649,23 @@ impl<F: Field> SubCircuitConfig<F> for CopyCircuitConfig<F> {
             is_tx_calldata,
             is_bytecode,
             is_memory,
+            is_memory_copy,
             is_tx_log,
+            is_access_list_address,
+            is_access_list_storage_key,
             q_enable,
+            copy_table,
+            is_id_unchange,
             is_src_end,
             is_word_end,
             non_pad_non_mask,
-            copy_table,
+            #[cfg(feature = "dual-bytecode")]
+            is_first_bytecode_table,
             tx_table,
             rw_table,
             bytecode_table,
+            #[cfg(feature = "dual-bytecode")]
+            bytecode_table1,
         }
     }
 }
@@ -468,16 +678,16 @@ impl<F: Field> CopyCircuitConfig<F> {
         region: &mut Region<F>,
         offset: &mut usize,
         tag_chip: &BinaryNumberChip<F, CopyDataType, { CopyDataType::N_BITS }>,
+        is_id_unchange: &IsEqualChip<F>,
         is_src_end_chip: &IsEqualChip<F>,
         lt_word_end_chip: &IsEqualChip<F>,
         challenges: Challenges<Value<F>>,
         copy_event: &CopyEvent,
+        bytecode_map: Option<&BTreeMap<Word, bool>>,
     ) -> Result<(), Error> {
-        for (step_idx, (tag, table_row, circuit_row)) in
-            CopyTable::assignments(copy_event, challenges)
-                .iter()
-                .enumerate()
-        {
+        let copy_rows = CopyTable::assignments(copy_event, challenges, bytecode_map);
+
+        for (step_idx, (tag, table_row, circuit_row)) in copy_rows.iter().enumerate() {
             let is_read = step_idx % 2 == 0;
 
             // Copy table assignments
@@ -518,6 +728,8 @@ impl<F: Field> CopyCircuitConfig<F> {
                 self.mask,
                 self.front_mask,
                 self.word_index,
+                #[cfg(feature = "dual-bytecode")]
+                self.is_first_bytecode_table,
             ]
             .iter()
             .zip_eq(circuit_row)
@@ -543,6 +755,20 @@ impl<F: Field> CopyCircuitConfig<F> {
                     Value::known(F::from(copy_event.src_addr_end)),
                 )?;
             }
+
+            let (id, id_next) = if is_read {
+                (&copy_event.src_id, &copy_event.dst_id)
+            } else {
+                (&copy_event.dst_id, &copy_event.src_id)
+            };
+
+            // assign id, id_next
+            is_id_unchange.assign(
+                region,
+                *offset,
+                number_or_hash_to_field(id, challenges.evm_word()),
+                number_or_hash_to_field(id_next, challenges.evm_word()),
+            )?;
 
             lt_word_end_chip.assign(
                 region,
@@ -579,11 +805,33 @@ impl<F: Field> CopyCircuitConfig<F> {
                 *offset,
                 || Value::known(F::from(tag.eq(&CopyDataType::Memory))),
             )?;
+            let is_memory_copy = copy_event.src_id == copy_event.dst_id
+                && copy_event.src_type.eq(&CopyDataType::Memory)
+                && copy_event.dst_type.eq(&CopyDataType::Memory);
+            region.assign_advice(
+                || format!("is_memory_copy at row: {}", *offset),
+                self.is_memory_copy,
+                *offset,
+                || Value::known(F::from(is_memory_copy)),
+            )?;
+
             region.assign_advice(
                 || format!("is_tx_log at row: {}", *offset),
                 self.is_tx_log,
                 *offset,
                 || Value::known(F::from(tag.eq(&CopyDataType::TxLog))),
+            )?;
+            region.assign_advice(
+                || format!("is_access_list_address at row: {}", *offset),
+                self.is_access_list_address,
+                *offset,
+                || Value::known(F::from(tag.eq(&CopyDataType::AccessListAddresses))),
+            )?;
+            region.assign_advice(
+                || format!("is_access_list_storage_key at row: {}", *offset),
+                self.is_access_list_storage_key,
+                *offset,
+                || Value::known(F::from(tag.eq(&CopyDataType::AccessListStorageKeys))),
             )?;
 
             *offset += 1;
@@ -599,6 +847,7 @@ impl<F: Field> CopyCircuitConfig<F> {
         copy_events: &[CopyEvent],
         max_copy_rows: usize,
         challenges: Challenges<Value<F>>,
+        bytecode_map: Option<&BTreeMap<Word, bool>>,
     ) -> Result<(), Error> {
         let copy_rows_needed = copy_events
             .iter()
@@ -617,6 +866,7 @@ impl<F: Field> CopyCircuitConfig<F> {
         let filler_rows = max_copy_rows - copy_rows_needed - DISABLED_ROWS;
 
         let tag_chip = BinaryNumberChip::construct(self.copy_table.tag);
+        let is_id_unchange = IsEqualChip::construct(self.is_id_unchange.clone());
         let is_src_end_chip = IsEqualChip::construct(self.is_src_end.clone());
         let lt_word_end_chip = IsEqualChip::construct(self.is_word_end.clone());
 
@@ -652,20 +902,22 @@ impl<F: Field> CopyCircuitConfig<F> {
                         &mut region,
                         &mut offset,
                         &tag_chip,
+                        &is_id_unchange,
                         &is_src_end_chip,
                         &lt_word_end_chip,
                         challenges,
                         copy_event,
+                        bytecode_map,
                     )?;
                     log::trace!("offset after {}th copy event: {}", ev_idx, offset);
                 }
-
                 for _ in 0..filler_rows {
                     self.assign_padding_row(
                         &mut region,
                         &mut offset,
                         true,
                         &tag_chip,
+                        &is_id_unchange,
                         &is_src_end_chip,
                         &lt_word_end_chip,
                     )?;
@@ -678,6 +930,7 @@ impl<F: Field> CopyCircuitConfig<F> {
                         &mut offset,
                         false,
                         &tag_chip,
+                        &is_id_unchange,
                         &is_src_end_chip,
                         &lt_word_end_chip,
                     )?;
@@ -695,6 +948,7 @@ impl<F: Field> CopyCircuitConfig<F> {
         offset: &mut usize,
         enabled: bool,
         tag_chip: &BinaryNumberChip<F, CopyDataType, { CopyDataType::N_BITS }>,
+        is_id_unchange_chip: &IsEqualChip<F>,
         is_src_end_chip: &IsEqualChip<F>,
         lt_word_end_chip: &IsEqualChip<F>,
     ) -> Result<(), Error> {
@@ -714,6 +968,14 @@ impl<F: Field> CopyCircuitConfig<F> {
         region.assign_advice(
             || format!("assign is_first {}", *offset),
             self.copy_table.is_first,
+            *offset,
+            || Value::known(F::zero()),
+        )?;
+        #[cfg(feature = "dual-bytecode")]
+        // is_first_bytecode_table
+        region.assign_advice(
+            || format!("assign is_first_bytecode_table {}", *offset),
+            self.is_first_bytecode_table,
             *offset,
             || Value::known(F::zero()),
         )?;
@@ -841,6 +1103,12 @@ impl<F: Field> CopyCircuitConfig<F> {
         // tag
         tag_chip.assign(region, *offset, &CopyDataType::Padding)?;
         // Assign IsEqual gadgets
+        is_id_unchange_chip.assign(
+            region,
+            *offset,
+            Value::known(F::zero()),
+            Value::known(F::one()),
+        )?;
         is_src_end_chip.assign(
             region,
             *offset,
@@ -864,7 +1132,10 @@ impl<F: Field> CopyCircuitConfig<F> {
             self.is_tx_calldata,
             self.is_bytecode,
             self.is_memory,
+            self.is_memory_copy,
             self.is_tx_log,
+            self.is_access_list_address,
+            self.is_access_list_storage_key,
         ] {
             region.assign_advice(
                 || format!("assigning padding row: {}", *offset),
@@ -904,18 +1175,26 @@ pub struct CopyCircuit<F: Field> {
     pub copy_events: Vec<CopyEvent>,
     /// Max number of rows in copy circuit
     pub max_copy_rows: usize,
+    /// map for <code_hash, bool> bool value indicates come from first
+    /// bytecode circuit.
+    pub bytecode_map: Option<BTreeMap<Word, bool>>,
     _marker: PhantomData<F>,
-    /// Data for external lookup tables
+    /// Data for external lookup tables, currently this field only used for testing.
     pub external_data: ExternalData,
 }
 
 impl<F: Field> CopyCircuit<F> {
     /// Return a new CopyCircuit
-    pub fn new(copy_events: Vec<CopyEvent>, max_copy_rows: usize) -> Self {
+    pub fn new(
+        copy_events: Vec<CopyEvent>,
+        max_copy_rows: usize,
+        bytecode_map: Option<BTreeMap<Word, bool>>,
+    ) -> Self {
         Self {
             copy_events,
             max_copy_rows,
-            _marker: PhantomData::default(),
+            bytecode_map,
+            _marker: PhantomData,
             external_data: ExternalData::default(),
         }
     }
@@ -924,12 +1203,14 @@ impl<F: Field> CopyCircuit<F> {
     pub fn new_with_external_data(
         copy_events: Vec<CopyEvent>,
         max_copy_rows: usize,
+        bytecode_map: Option<BTreeMap<Word, bool>>,
         external_data: ExternalData,
     ) -> Self {
         Self {
             copy_events,
             max_copy_rows,
-            _marker: PhantomData::default(),
+            bytecode_map,
+            _marker: PhantomData,
             external_data,
         }
     }
@@ -938,10 +1219,11 @@ impl<F: Field> CopyCircuit<F> {
     /// to assign lookup tables.  This constructor is only suitable to be
     /// used by the SuperCircuit, which already assigns the external lookup
     /// tables.
-    pub fn new_from_block_no_external(block: &witness::Block<F>) -> Self {
+    pub fn new_from_block_no_external(block: &witness::Block) -> Self {
         Self::new(
             block.copy_events.clone(),
             block.circuits_params.max_copy_rows,
+            block.bytecode_map.clone(),
         )
     }
 }
@@ -955,10 +1237,11 @@ impl<F: Field> SubCircuit<F> for CopyCircuit<F> {
         6
     }
 
-    fn new_from_block(block: &witness::Block<F>) -> Self {
+    fn new_from_block(block: &witness::Block) -> Self {
         Self::new_with_external_data(
             block.copy_events.clone(),
             block.circuits_params.max_copy_rows,
+            block.bytecode_map.clone(),
             ExternalData {
                 max_txs: block.circuits_params.max_txs,
                 max_calldata: block.circuits_params.max_calldata,
@@ -971,7 +1254,7 @@ impl<F: Field> SubCircuit<F> for CopyCircuit<F> {
     }
 
     /// Return the minimum number of rows required to prove the block
-    fn min_num_rows_block(block: &witness::Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &witness::Block) -> (usize, usize) {
         let row_num = block
             .copy_events
             .iter()
@@ -989,7 +1272,13 @@ impl<F: Field> SubCircuit<F> for CopyCircuit<F> {
         challenges: &Challenges<Value<F>>,
         layouter: &mut impl Layouter<F>,
     ) -> Result<(), Error> {
-        config.assign_copy_events(layouter, &self.copy_events, self.max_copy_rows, *challenges)
+        config.assign_copy_events(
+            layouter,
+            &self.copy_events,
+            self.max_copy_rows,
+            *challenges,
+            self.bytecode_map.as_ref(),
+        )
     }
 }
 

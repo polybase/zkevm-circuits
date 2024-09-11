@@ -1,6 +1,10 @@
-use bus_mapping::precompile::{PrecompileAuxData, MODEXP_INPUT_LIMIT, MODEXP_SIZE_LIMIT};
-use eth_types::{evm_types::GasCost, Field, ToBigEndian, ToScalar, U256};
+use crate::util::Field;
+use bus_mapping::precompile::{
+    PrecompileAuxData, PrecompileCalls, MODEXP_INPUT_LIMIT, MODEXP_SIZE_LIMIT,
+};
+use eth_types::{evm_types::GasCost, ToBigEndian, U256};
 use gadgets::util::{self, not, select, Expr};
+use gadgets::ToScalar;
 use halo2_proofs::{
     circuit::Value,
     plonk::{Error, Expression},
@@ -9,7 +13,7 @@ use halo2_proofs::{
 use crate::{
     evm_circuit::{
         execution::ExecutionGadget,
-        param::{N_BITS_U8, N_BYTES_U64, N_BYTES_WORD},
+        param::{N_BITS_U8, N_BYTES_MEMORY_ADDRESS, N_BYTES_U64, N_BYTES_WORD},
         step::ExecutionState,
         util::{
             common_gadget::RestoreContextGadget,
@@ -18,6 +22,7 @@ use crate::{
                 BinaryNumberGadget, BitLengthGadget, ByteOrWord, ByteSizeGadget,
                 ConstantDivisionGadget, IsZeroGadget, LtGadget, MinMaxGadget,
             },
+            padding_gadget::PaddingGadget,
             rlc, CachedRegion, Cell,
         },
     },
@@ -45,7 +50,7 @@ impl<F: Field, const BIT_LIMIT: usize> RandPowRepresent<F, BIT_LIMIT> {
             .expect("same length")
     }
 
-    /// refere to a binary represent of exponent (like BinaryNumberGadget), can
+    /// refer to a binary represent of exponent (like BinaryNumberGadget), can
     /// link another expression so the expr is linked_val * r ** exponent
     pub fn configure(
         cb: &mut EVMConstraintBuilder<F>,
@@ -58,7 +63,7 @@ impl<F: Field, const BIT_LIMIT: usize> RandPowRepresent<F, BIT_LIMIT> {
         cb.pow_of_rand_lookup(bits.value(), pow_lookup.expr());
 
         let pow = linked_val.unwrap_or_else(|| 1.expr()) * pow_lookup.expr();
-        // we would cache the pow expression in case degree is too larget
+        // we would cache the pow expression in case degree is too largest
         let cache_for_degree = if pow.degree() > Self::BIT_EXP_MAX_DEGREE {
             let cached_cell = cb.query_cell_phase2();
             cb.require_equal(
@@ -72,10 +77,10 @@ impl<F: Field, const BIT_LIMIT: usize> RandPowRepresent<F, BIT_LIMIT> {
         };
 
         Self {
-            pow_lookup,
             bits,
-            pow,
+            pow_lookup,
             cache_for_degree,
+            pow,
         }
     }
 
@@ -99,7 +104,7 @@ impl<F: Field, const BIT_LIMIT: usize> RandPowRepresent<F, BIT_LIMIT> {
         let pow_of_rand = region
             .challenges()
             .keccak_input()
-            .map(|v| v.pow(&[exponent as u64, 0, 0, 0]));
+            .map(|v| v.pow([exponent as u64, 0, 0, 0]));
         let value_should_assigned =
             linked_value.unwrap_or_else(|| Value::known(F::one())) * pow_of_rand;
 
@@ -419,7 +424,7 @@ impl<F: Field> ModExpInputs<F> {
             input_limbs.assign(region, offset, val_r)?;
         }
 
-        for (val, input_bytes) in values.zip([&self.base, &self.exp, &self.modulus]) {
+        for (&val, input_bytes) in values.iter().zip([&self.base, &self.exp, &self.modulus]) {
             assign_word(region, offset, input_bytes, val)?;
         }
 
@@ -521,8 +526,8 @@ impl<F: Field> Limbs<F> {
         ];
 
         Self {
-            byte14_split_hi,
             byte14_split_lo,
+            byte14_split_hi,
             limbs,
         }
     }
@@ -624,8 +629,8 @@ impl<F: Field> ModExpGasCost<F> {
             words,
             exp_is_zero,
             exp_byte_size,
-            exp_msb,
             exp_msb_bit_length,
+            exp_msb,
             calc_gas,
             dynamic_gas,
         }
@@ -701,9 +706,16 @@ impl<F: Field> ModExpGasCost<F> {
 
 #[derive(Clone, Debug)]
 pub struct ModExpGadget<F> {
+    input_bytes_rlc: Cell<F>,
+    output_bytes_rlc: Cell<F>,
+    return_bytes_rlc: Cell<F>,
+
+    pad_right: LtGadget<F, N_BYTES_MEMORY_ADDRESS>,
+    padding: PaddingGadget<F>,
+
     is_success: Cell<F>,
     callee_address: Cell<F>,
-    caller_id: Cell<F>,
+    is_root: Cell<F>,
     call_data_offset: Cell<F>,
     call_data_length: Cell<F>,
     return_data_offset: Cell<F>,
@@ -715,7 +727,6 @@ pub struct ModExpGadget<F> {
     output: ModExpOutputs<F>,
 
     input_bytes_acc: Cell<F>,
-    output_bytes_acc: Cell<F>,
     is_gas_insufficient: LtGadget<F, N_BYTES_U64>,
     gas_cost_gadget: ModExpGasCost<F>,
     garbage_bytes_holder: [Cell<F>; INPUT_LIMIT - 96],
@@ -727,15 +738,19 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
     const NAME: &'static str = "MODEXP";
 
     fn configure(cb: &mut EVMConstraintBuilder<F>) -> Self {
+        let (input_bytes_rlc, output_bytes_rlc, return_bytes_rlc) = (
+            cb.query_cell_phase2(),
+            cb.query_cell_phase2(),
+            cb.query_cell_phase2(),
+        );
         // we 'copy' the acc_bytes cell inside call_op step, so it must be the first query cells
         let input_bytes_acc = cb.query_cell_phase2();
-        let output_bytes_acc = cb.query_cell_phase2();
 
-        let [is_success, callee_address, caller_id, call_data_offset, call_data_length, return_data_offset, return_data_length] =
+        let [is_success, callee_address, is_root, call_data_offset, call_data_length, return_data_offset, return_data_length] =
             [
                 CallContextFieldTag::IsSuccess,
                 CallContextFieldTag::CalleeAddress,
-                CallContextFieldTag::CallerId,
+                CallContextFieldTag::IsRoot,
                 CallContextFieldTag::CallDataOffset,
                 CallContextFieldTag::CallDataLength,
                 CallContextFieldTag::ReturnDataOffset,
@@ -802,7 +817,7 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
 
         cb.require_equal(
             "output acc bytes must equal",
-            output_bytes_acc.expr(),
+            output_bytes_rlc.expr(),
             output.bytes_rlc(),
         );
 
@@ -812,23 +827,48 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
             cb.curr.state.gas_left.expr(),
         );
 
-        let rd_length = select::expr(is_success.expr(), input.modulus_len(), 0.expr());
+        let required_input_len = MODEXP_INPUT_LIMIT.expr();
+        let pad_right = LtGadget::construct(cb, call_data_length.expr(), required_input_len.expr());
+        let padding = cb.condition(pad_right.expr(), |cb| {
+            PaddingGadget::construct(
+                cb,
+                input_bytes_rlc.expr(),
+                call_data_length.expr(),
+                required_input_len,
+            )
+        });
+        cb.condition(not::expr(pad_right.expr()), |cb| {
+            cb.require_equal(
+                "no padding implies padded bytes == input bytes",
+                padding.padded_rlc(),
+                input_bytes_rlc.expr(),
+            );
+        });
+        cb.require_equal(
+            "copy padded input bytes",
+            padding.padded_rlc(),
+            input_bytes_acc.expr(),
+        );
 
-        let restore_context_gadget = RestoreContextGadget::construct2(
+        let restore_context_gadget = super::gen_restore_context(
             cb,
+            is_root.expr(),
             is_success.expr(),
             gas_cost.expr(),
-            0.expr(),
-            0.expr(),
-            rd_length,
-            0.expr(),
-            0.expr(),
+            select::expr(is_success.expr(), input.modulus_len(), 0.expr()),
         );
 
         Self {
+            input_bytes_rlc,
+            output_bytes_rlc,
+            return_bytes_rlc,
+
+            pad_right,
+            padding,
+
             is_success,
             callee_address,
-            caller_id,
+            is_root,
             call_data_offset,
             call_data_length,
             return_data_offset,
@@ -838,7 +878,6 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
             padding_zero,
             output,
             input_bytes_acc,
-            output_bytes_acc,
             is_gas_insufficient,
             gas_cost_gadget,
             garbage_bytes_holder,
@@ -849,7 +888,7 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _tx: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -866,9 +905,8 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
                 };
 
             let garbage_bytes = if call.call_data_length as usize > input_expected_len {
-                let mut bts = Vec::new();
-                bts.resize(input_expected_len - 96, 0); //front prefix zero
-                bts.append(&mut Vec::from(&data.input_memory[input_expected_len..]));
+                let mut bts = vec![0; input_expected_len - 96]; //front prefix zero
+                bts.append(&mut Vec::from(&data.input_bytes[input_expected_len..]));
                 bts.resize(96, 0); //padding zero
                 bts
             } else {
@@ -888,7 +926,17 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
             let input_rlc = region
                 .challenges()
                 .keccak_input()
-                .map(|randomness| rlc::value(data.input_memory.iter().rev(), randomness));
+                .map(|randomness| rlc::value(data.input_bytes.iter().rev(), randomness));
+
+            self.input_bytes_rlc.assign(region, offset, input_rlc)?;
+            self.return_bytes_rlc.assign(
+                region,
+                offset,
+                region
+                    .challenges()
+                    .keccak_input()
+                    .map(|r| rlc::value(data.return_bytes.iter().rev(), r)),
+            )?;
 
             // if the input to modexp has more than 192 bytes, then we only keep the first 192 bytes
             // and discard the remaining bytes
@@ -901,16 +949,16 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
             let n_padded_zeroes_pow = region
                 .challenges()
                 .keccak_input()
-                .map(|r| r.pow(&[n_padded_zeros, 0, 0, 0]));
+                .map(|r| r.pow([n_padded_zeros, 0, 0, 0]));
 
             let output_rlc = region
                 .challenges()
                 .keccak_input()
-                .map(|randomness| rlc::value(data.output_memory.iter().rev(), randomness));
+                .map(|randomness| rlc::value(data.output_bytes.iter().rev(), randomness));
 
             self.input_bytes_acc
                 .assign(region, offset, n_padded_zeroes_pow * input_rlc)?;
-            self.output_bytes_acc.assign(region, offset, output_rlc)?;
+            self.output_bytes_rlc.assign(region, offset, output_rlc)?;
 
             let required_gas_cost = self.gas_cost_gadget.assign(
                 region,
@@ -924,6 +972,19 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
                 offset,
                 F::from(step.gas_left),
                 F::from(required_gas_cost),
+            )?;
+            self.pad_right
+                .assign(region, offset, call.call_data_length.into(), 192.into())?;
+            self.padding.assign(
+                region,
+                offset,
+                PrecompileCalls::Modexp,
+                region
+                    .challenges()
+                    .keccak_input()
+                    .map(|r| rlc::value(data.input_bytes.iter().rev(), r)),
+                call.call_data_length,
+                region.challenges().keccak_input(),
             )?;
         } else {
             log::error!("unexpected aux_data {:?} for modexp", step.aux_data);
@@ -940,8 +1001,8 @@ impl<F: Field> ExecutionGadget<F> for ModExpGadget<F> {
             offset,
             Value::known(call.code_address.unwrap().to_scalar().unwrap()),
         )?;
-        self.caller_id
-            .assign(region, offset, Value::known(F::from(call.caller_id as u64)))?;
+        self.is_root
+            .assign(region, offset, Value::known(F::from(call.is_root as u64)))?;
         self.call_data_offset.assign(
             region,
             offset,
@@ -977,15 +1038,17 @@ mod test {
         precompile::PrecompileCalls,
     };
     use eth_types::{bytecode, word, ToWord};
+    use ethers_core::k256::elliptic_curve::PrimeField;
     use itertools::Itertools;
     use mock::TestContext;
+    use std::sync::LazyLock;
 
     use crate::test_util::CircuitTestBuilder;
 
     #[test]
     fn test_limbs() {
         use crate::table::ModExpTable;
-        use halo2_proofs::{arithmetic::FieldExt, halo2curves::bn256::Fr};
+        use halo2_proofs::halo2curves::bn256::Fr;
         use misc_precompiled_circuit::circuits::modexp::Number;
         use num_bigint::BigUint;
 
@@ -1040,444 +1103,462 @@ mod test {
         //Limb::new(None, value)
     }
 
-    lazy_static::lazy_static! {
-        static ref TEST_VECTOR: Vec<PrecompileCallArgs> = {
-            vec![
-                PrecompileCallArgs {
-                    name: "modexp success",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x1)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x1)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x08090A0000000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x63.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+    static TEST_VECTOR: LazyLock<Vec<PrecompileCallArgs>> = LazyLock::new(|| {
+        vec![
+            PrecompileCallArgs {
+                name: "modexp success",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x1)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x1)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x08090A0000000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp success",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x3)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x2)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0800000901000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x66.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x63.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp success",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x3)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x2)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0800000901000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp success with padding 0, input len > minimal 96 bytes",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x3)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x2)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0800000901000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x65.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x66.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp success with padding 0, input len > minimal 96 bytes",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x3)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x2)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0800000901000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp success with padding 0, input len < minimal 96 bytes",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x3)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x2)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0800000901000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x40.into(), // < minimal 96 bytes
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x65.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp success with padding 0, input len < minimal 96 bytes",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x3)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x2)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0800000901000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp no input",
-                    setup_code: bytecode! {
-                        // just put something in memory
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x0.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x40.into(), // < minimal 96 bytes
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp no input",
+                setup_code: bytecode! {
+                    // just put something in memory
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp success with garbage bytes",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x3)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x2)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0800000901000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                        PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000009"))
-                        PUSH1(0x80)
-                        MSTORE
-                        PUSH32(word!("0xfcb51a0695d8f838b1ee009b3fbf66bda078cd64590202a864a8f3e8c4315c47"))
-                        PUSH1(0xA0)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0xc0.into(),
-                    ret_offset: 0xe0.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x0.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp success with garbage bytes",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x3)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x2)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0800000901000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
+                    PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000009"))
+                    PUSH1(0x80)
+                    MSTORE
+                    PUSH32(word!("0xfcb51a0695d8f838b1ee009b3fbf66bda078cd64590202a864a8f3e8c4315c47"))
+                    PUSH1(0xA0)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp zero modulus",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x2)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x0)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0800090000000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x63.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0xc0.into(),
+                ret_offset: 0xe0.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp zero modulus",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x2)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x0)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0800090000000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp all zero bit len",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x0)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x0)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x0)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0800090000000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x63.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x21.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x63.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp all zero bit len",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x0)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x0)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x0)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0800090000000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp zero base and exponent",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x1)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x1)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0000090000000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x64.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x63.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x21.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp zero base and exponent",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x1)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x1)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0000090000000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp zero exponent and modulus",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x1)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x1)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0800009000000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x64.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x64.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp zero exponent and modulus",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x1)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x1)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0800009000000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp zero base and modulus",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x1)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x1)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0008009000000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x64.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x64.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp zero base and modulus",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x1)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x1)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0008009000000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-            ]
-        };
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x64.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+        ]
+    });
 
-        static ref TEST_U256_VECTOR: Vec<PrecompileCallArgs> = {
-            vec![
-                PrecompileCallArgs {
-                    name: "modexp length in u256",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x20)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x20)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x20)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000008"))
-                        PUSH1(0x60)
-                        MSTORE
-                        PUSH32(word!("0x1000000000000000000000000000000000000000000000000000000000000009"))
-                        PUSH1(0x80)
-                        MSTORE
-                        PUSH32(word!("0xfcb51a0695d8f838b1ee009b3fbf66bda078cd64590202a864a8f3e8c4315c47"))
-                        PUSH1(0xA0)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0xc0.into(),
-                    ret_offset: 0xe0.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+    static TEST_U256_VECTOR: LazyLock<Vec<PrecompileCallArgs>> = LazyLock::new(|| {
+        vec![
+            PrecompileCallArgs {
+                name: "modexp length in u256",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x20)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x20)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x20)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000008"))
+                    PUSH1(0x60)
+                    MSTORE
+                    PUSH32(word!("0x1000000000000000000000000000000000000000000000000000000000000009"))
+                    PUSH1(0x80)
+                    MSTORE
+                    PUSH32(word!("0xfcb51a0695d8f838b1ee009b3fbf66bda078cd64590202a864a8f3e8c4315c47"))
+                    PUSH1(0xA0)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp length in u256 and result wrapped",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x20)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x20)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x20)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000008"))
-                        PUSH1(0x60)
-                        MSTORE
-                        PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000064"))
-                        PUSH1(0x80)
-                        MSTORE
-                        PUSH32(word!("0xfcb51a0695d8f838b1ee009b3fbf66bda078cd64590202a864a8f3e8c4315c47"))
-                        PUSH1(0xA0)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0xc0.into(),
-                    ret_offset: 0xe0.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0xc0.into(),
+                ret_offset: 0xe0.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp length in u256 and result wrapped",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x20)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x20)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x20)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000008"))
+                    PUSH1(0x60)
+                    MSTORE
+                    PUSH32(word!("0x0000000000000000000000000000000000000000000000000000000000000064"))
+                    PUSH1(0x80)
+                    MSTORE
+                    PUSH32(word!("0xfcb51a0695d8f838b1ee009b3fbf66bda078cd64590202a864a8f3e8c4315c47"))
+                    PUSH1(0xA0)
+                    MSTORE
                 },
-            ]
-        };
+                call_data_offset: 0x0.into(),
+                call_data_length: 0xc0.into(),
+                ret_offset: 0xe0.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                ..Default::default()
+            },
+        ]
+    });
 
-        static ref TEST_INVALID_VECTOR: Vec<PrecompileCallArgs> = {
-            vec![
-                PrecompileCallArgs {
-                    name: "modexp Msize length too large invalid",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x1)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x1)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x21)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x08090A0000000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0x60)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0x63.into(),
-                    ret_offset: 0x9f.into(),
-                    ret_size: 0x01.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    gas: 100000.into(),
-                    ..Default::default()
+    static TEST_INVALID_VECTOR: LazyLock<Vec<PrecompileCallArgs>> = LazyLock::new(|| {
+        vec![
+            PrecompileCallArgs {
+                name: "modexp Msize length too large invalid",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x1)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x1)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x21)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x08090A0000000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x60)
+                    MSTORE
                 },
-                PrecompileCallArgs {
-                    name: "modexp Base&Esize&Msize length too large invalid",
-                    setup_code: bytecode! {
-                        // Base size
-                        PUSH1(0x21)
-                        PUSH1(0x00)
-                        MSTORE
-                        // Esize
-                        PUSH1(0x21)
-                        PUSH1(0x20)
-                        MSTORE
-                        // Msize
-                        PUSH1(0x21)
-                        PUSH1(0x40)
-                        MSTORE
-                        // B, E and M
-                        PUSH32(word!("0x1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed"))
-                        PUSH1(0x60)
-                        MSTORE
-                        PUSH32(word!("0x198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2"))
-                        PUSH1(0x80)
-                        MSTORE
-                        PUSH32(word!("0x12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa"))
-                        PUSH1(0xa0)
-                        MSTORE
-                        PUSH32(word!("0x08090A0000000000000000000000000000000000000000000000000000000000"))
-                        PUSH1(0xc0)
-                        MSTORE
-                    },
-                    call_data_offset: 0x0.into(),
-                    call_data_length: 0xc3.into(),
-                    ret_offset: 0xe0.into(),
-                    ret_size: 0x21.into(),
-                    address: PrecompileCalls::Modexp.address().to_word(),
-                    gas: 1000.into(),
-                    ..Default::default()
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x63.into(),
+                ret_offset: 0x9f.into(),
+                ret_size: 0x01.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                gas: 100000.into(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "modexp Base&Esize&Msize length too large invalid",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH1(0x21)
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH1(0x21)
+                    PUSH1(0x20)
+                    MSTORE
+                    // Msize
+                    PUSH1(0x21)
+                    PUSH1(0x40)
+                    MSTORE
+                    // B, E and M
+                    PUSH32(word!("0x1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed"))
+                    PUSH1(0x60)
+                    MSTORE
+                    PUSH32(word!("0x198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2"))
+                    PUSH1(0x80)
+                    MSTORE
+                    PUSH32(word!("0x12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa"))
+                    PUSH1(0xa0)
+                    MSTORE
+                    PUSH32(word!("0x08090A0000000000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0xc0)
+                    MSTORE
                 },
-            ]
-        };
-    }
+                call_data_offset: 0x0.into(),
+                call_data_length: 0xc3.into(),
+                ret_offset: 0xe0.into(),
+                ret_size: 0x21.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                gas: 1000.into(),
+                ..Default::default()
+            },
+            PrecompileCallArgs {
+                name: "from test tool: zero padding and invalid size",
+                setup_code: bytecode! {
+                    // Base size
+                    PUSH32(word!("0x0000000000800000000000000000000000000000000000000000000000000000"))
+                    PUSH1(0x00)
+                    MSTORE
+                    // Esize
+                    PUSH32(word!("0x000000400000000000000000000000a000000000000000000000000000000000"))
+                    PUSH1(0x20)
+                    MSTORE
+                },
+                call_data_offset: 0x0.into(),
+                call_data_length: 0x30.into(),
+                ret_offset: 0xe0.into(),
+                ret_size: 0x20.into(),
+                address: PrecompileCalls::Modexp.address().to_word(),
+                gas: 100000.into(),
+                ..Default::default()
+            },
+        ]
+    });
 
     #[ignore]
     #[test]
@@ -1528,10 +1609,10 @@ mod test {
         }
     }
 
-    // notice, "invalid" test would not actuall work until bus-mapping put calling fail case being
+    // notice, "invalid" test would not actually work until bus-mapping put calling fail case being
     // handle in normal CallOp, i.e. return None in
     // bus_mapping::circuit_input_builder::input_state_ref::CircuitInputStateRef::get_step_err
-    // for unsuccess (call.is_success is false) call
+    // for unsuccessful (call.is_success is false) call
     // current it is handled by the dummy "precompile error" gadget
     #[cfg(feature = "scroll")]
     #[test]

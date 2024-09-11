@@ -3,11 +3,13 @@
 
 use std::{iter, marker::PhantomData};
 
+use crate::util::Field;
 use bus_mapping::{
     circuit_input_builder::{EcAddOp, EcMulOp, EcPairingOp, N_BYTES_PER_PAIR, N_PAIRING_PER_OP},
     precompile::PrecompileCalls,
 };
-use eth_types::{Field, ToLittleEndian, ToScalar, U256};
+use eth_types::{ToLittleEndian, U256};
+use gadgets::ToScalar;
 use halo2_base::{
     gates::{GateInstructions, RangeInstructions},
     utils::{decompose_bigint_option, fe_to_biguint, modulus},
@@ -25,7 +27,6 @@ use halo2_ecc::{
     },
 };
 use halo2_proofs::{
-    arithmetic::Field as Halo2Field,
     circuit::{Layouter, Value},
     halo2curves::{
         bn256::{Fq, Fq12, Fq2, Fr, G1Affine, G2Affine},
@@ -487,7 +488,7 @@ impl<F: Field, const XI_0: i64> EccCircuit<F, XI_0> {
         powers_of_256: &[QuantumCell<F>],
         op: &EcAddOp,
     ) -> EcAddDecomposed<F> {
-        log::trace!("[ECC] ==> EcAdd Assignmnet START:");
+        log::trace!("[ECC] ==> EcAdd Assignment START:");
         log_context_cursor!(ctx);
 
         let (px, px_cells, px_valid, px_is_zero) =
@@ -576,7 +577,7 @@ impl<F: Field, const XI_0: i64> EccCircuit<F, XI_0> {
 
         ecc_chip.assert_equal(ctx, &rand_point, &sum3);
 
-        log::trace!("[ECC] EcAdd Assignmnet END:");
+        log::trace!("[ECC] EcAdd Assignment END:");
         log_context_cursor!(ctx);
 
         EcAddDecomposed {
@@ -608,7 +609,7 @@ impl<F: Field, const XI_0: i64> EccCircuit<F, XI_0> {
         powers_of_256: &[QuantumCell<F>],
         op: &EcMulOp,
     ) -> EcMulDecomposed<F> {
-        log::trace!("[ECC] ==> EcMul Assignmnet START:");
+        log::trace!("[ECC] ==> EcMul Assignment START:");
         log_context_cursor!(ctx);
 
         let (px, px_cells, px_valid, px_is_zero) =
@@ -659,7 +660,7 @@ impl<F: Field, const XI_0: i64> EccCircuit<F, XI_0> {
         let point_r_got = ecc_chip.select(ctx, &point_r_got, &infinity, &is_valid);
         ecc_chip.assert_equal(ctx, &point_r.ec_point, &point_r_got);
 
-        log::trace!("[ECC] EcMul Assignmnet END:");
+        log::trace!("[ECC] EcMul Assignment END:");
         log_context_cursor!(ctx);
 
         EcMulDecomposed {
@@ -1316,7 +1317,7 @@ impl<F: Field, const XI_0: i64> EccCircuit<F, XI_0> {
 impl<F: Field, const XI_0: i64> SubCircuit<F> for EccCircuit<F, XI_0> {
     type Config = EccCircuitConfig<F>;
 
-    fn new_from_block(block: &Block<F>) -> Self {
+    fn new_from_block(block: &Block) -> Self {
         Self {
             max_add_ops: block.circuits_params.max_ec_ops.ec_add,
             max_mul_ops: block.circuits_params.max_ec_ops.ec_mul,
@@ -1352,7 +1353,7 @@ impl<F: Field, const XI_0: i64> SubCircuit<F> for EccCircuit<F, XI_0> {
         Ok(())
     }
 
-    fn min_num_rows_block(block: &Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &Block) -> (usize, usize) {
         let row_num = if block.circuits_params.max_vertical_circuit_rows == 0 {
             Self::min_num_rows()
         } else {

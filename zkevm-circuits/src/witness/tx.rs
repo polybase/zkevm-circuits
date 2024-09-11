@@ -1,9 +1,9 @@
 use crate::{
     evm_circuit::{step::ExecutionState, util::rlc},
     table::TxContextFieldTag,
-    util::{rlc_be_bytes, Challenges},
+    util::{rlc_be_bytes, Challenges, Field},
     witness::{
-        rlp_fsm::SmState,
+        rlp_fsm::{RlpStackOp, SmState},
         DataTable, Format,
         Format::{
             L1MsgHash, TxHashEip155, TxHashEip1559, TxHashEip2930, TxHashPreEip155, TxSignEip155,
@@ -12,24 +12,27 @@ use crate::{
         RlpFsmWitnessGen, RlpFsmWitnessRow, RlpTable, RlpTag, State,
         State::DecodeTagStart,
         StateMachine,
-        Tag::{EndList, EndVector},
+        Tag::{EndObject, EndVector},
     },
 };
 use bus_mapping::circuit_input_builder::{self, get_dummy_tx_hash, TxL1Fee};
 use eth_types::{
-    evm_types::gas_utils::tx_data_gas_cost,
-    geth_types::{TxType, TxType::PreEip155},
+    evm_types::gas_utils::{tx_access_list_gas_cost, tx_data_gas_cost},
+    geth_types::{access_list_size, TxType, TxType::PreEip155},
     sign_types::{
-        biguint_to_32bytes_le, ct_option_ok_or, get_dummy_tx, recover_pk, SignData, SECP256K1_Q,
+        biguint_to_32bytes_le, ct_option_ok_or, get_dummy_tx, recover_pk2, SignData, SECP256K1_Q,
     },
-    Address, Error, Field, Signature, ToBigEndian, ToLittleEndian, ToScalar, ToWord, Word, H256,
+    AccessList, Address, Error, Signature, ToBigEndian, ToLittleEndian, ToWord, Word, H256,
 };
-use ethers_core::{types::TransactionRequest, utils::keccak256};
+use ethers_core::{
+    types::TransactionRequest,
+    utils::{keccak256, rlp::Encodable},
+};
+use gadgets::ToScalar;
 use halo2_proofs::{
     circuit::Value,
     halo2curves::{group::ff::PrimeField, secp256k1},
 };
-use mock::MockTransaction;
 use num::Integer;
 use num_bigint::BigUint;
 use std::{cmp::Ordering, collections::BTreeMap};
@@ -53,6 +56,10 @@ pub struct Transaction {
     pub gas: u64,
     /// The gas price
     pub gas_price: Word,
+    /// Max fee per gas (EIP1559)
+    pub max_fee_per_gas: Word,
+    /// Max priority fee per gas (EIP1559)
+    pub max_priority_fee_per_gas: Word,
     /// The caller address
     pub caller_address: Address,
     /// The callee address
@@ -67,6 +74,8 @@ pub struct Transaction {
     pub call_data_length: usize,
     /// The gas cost for transaction call data
     pub call_data_gas_cost: u64,
+    /// The gas cost for access list (EIP 2930)
+    pub access_list_gas_cost: u64,
     /// The gas cost for rlp-encoded bytes of unsigned tx
     pub tx_data_gas_cost: u64,
     /// Chain ID as per EIP-155.
@@ -85,6 +94,8 @@ pub struct Transaction {
     pub l1_fee: TxL1Fee,
     /// Committed values of L1 fee
     pub l1_fee_committed: TxL1Fee,
+    /// Optional access list for EIP-2930
+    pub access_list: Option<AccessList>,
     /// The calls made in the transaction
     pub calls: Vec<Call>,
     /// The steps executioned in the transaction
@@ -119,6 +130,11 @@ impl Transaction {
         }
     }
 
+    /// Return whether the transaction is included in the chunk txbytes (not l1Msg and not padding)
+    pub fn is_chunk_l2_tx(&self) -> bool {
+        self.tx_type != TxType::L1Msg && !self.caller_address.is_zero()
+    }
+
     /// Sign data
     pub fn sign_data(&self) -> Result<SignData, Error> {
         if self.r.is_zero() && self.s.is_zero() && self.v == 0 {
@@ -126,26 +142,17 @@ impl Transaction {
         }
         let sig_r_le = self.r.to_le_bytes();
         let sig_s_le = self.s.to_le_bytes();
-        let sig_r = ct_option_ok_or(
-            secp256k1::Fq::from_repr(sig_r_le),
-            Error::Signature(libsecp256k1::Error::InvalidSignature),
-        )?;
-        let sig_s = ct_option_ok_or(
-            secp256k1::Fq::from_repr(sig_s_le),
-            Error::Signature(libsecp256k1::Error::InvalidSignature),
-        )?;
+        let sig_r = ct_option_ok_or(secp256k1::Fq::from_repr(sig_r_le), Error::Signature)?;
+        let sig_s = ct_option_ok_or(secp256k1::Fq::from_repr(sig_s_le), Error::Signature)?;
         let msg = self.rlp_unsigned.clone().into();
         let msg_hash = keccak256(&self.rlp_unsigned);
         let v = self.tx_type.get_recovery_id(self.v);
-        let pk = recover_pk(v, &self.r, &self.s, &msg_hash)?;
+        let pk = recover_pk2(v, &self.r, &self.s, &msg_hash)?;
         // msg_hash = msg_hash % q
         let msg_hash = BigUint::from_bytes_be(msg_hash.as_slice());
         let msg_hash = msg_hash.mod_floor(&*SECP256K1_Q);
         let msg_hash_le = biguint_to_32bytes_le(msg_hash);
-        let msg_hash = ct_option_ok_or(
-            secp256k1::Fq::from_repr(msg_hash_le),
-            libsecp256k1::Error::InvalidMessage,
-        )?;
+        let msg_hash = ct_option_ok_or(secp256k1::Fq::from_repr(msg_hash_le), Error::Signature)?;
         Ok(SignData {
             signature: (sig_r, sig_s, v),
             pk,
@@ -161,9 +168,11 @@ impl Transaction {
     pub fn table_assignments_fixed<F: Field>(
         &self,
         challenges: Challenges<Value<F>>,
-    ) -> Vec<[Value<F>; 4]> {
+    ) -> Vec<[Value<F>; 5]> {
         let tx_hash_be_bytes = keccak256(&self.rlp_signed);
         let tx_sign_hash_be_bytes = keccak256(&self.rlp_unsigned);
+        let (access_list_address_size, access_list_storage_key_size) =
+            access_list_size(&self.access_list);
 
         let ret = vec![
             [
@@ -171,6 +180,7 @@ impl Transaction {
                 Value::known(F::from(TxContextFieldTag::Nonce as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.nonce)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
@@ -179,18 +189,21 @@ impl Transaction {
                 challenges
                     .evm_word()
                     .map(|challenge| rlc::value(&self.gas_price.to_le_bytes(), challenge)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::Gas as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.gas)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::CallerAddress as u64)),
                 Value::known(F::zero()),
                 Value::known(self.caller_address.to_scalar().unwrap()),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
@@ -202,12 +215,14 @@ impl Transaction {
                         .to_scalar()
                         .unwrap(),
                 ),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::IsCreate as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.is_create as u64)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
@@ -216,102 +231,165 @@ impl Transaction {
                 challenges
                     .evm_word()
                     .map(|challenge| rlc::value(&self.value.to_le_bytes(), challenge)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::CallDataRLC as u64)),
                 Value::known(F::zero()),
                 rlc_be_bytes(&self.call_data, challenges.keccak_input()),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::CallDataLength as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.call_data_length as u64)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::CallDataGasCost as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.call_data_gas_cost)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::TxDataGasCost as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.tx_data_gas_cost)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::ChainID as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.chain_id)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::SigV as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.v)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::SigR as u64)),
                 Value::known(F::zero()),
                 rlc_be_bytes(&self.r.to_be_bytes(), challenges.evm_word()),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::SigS as u64)),
                 Value::known(F::zero()),
                 rlc_be_bytes(&self.s.to_be_bytes(), challenges.evm_word()),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::TxSignLength as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.rlp_unsigned.len() as u64)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::TxSignRLC as u64)),
                 Value::known(F::zero()),
                 rlc_be_bytes(&self.rlp_unsigned, challenges.keccak_input()),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::TxSignHash as u64)),
                 Value::known(F::zero()),
                 rlc_be_bytes(&tx_sign_hash_be_bytes, challenges.evm_word()),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::TxHashLength as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.rlp_signed.len() as u64)),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::TxHashRLC as u64)),
                 Value::known(F::zero()),
                 rlc_be_bytes(&self.rlp_signed, challenges.keccak_input()),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::TxHash as u64)),
                 Value::known(F::zero()),
                 rlc_be_bytes(&tx_hash_be_bytes, challenges.evm_word()),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::TxType as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.tx_type as u64)),
+                Value::known(F::zero()),
+            ],
+            [
+                Value::known(F::from(self.id as u64)),
+                Value::known(F::from(TxContextFieldTag::AccessListAddressesLen as u64)),
+                Value::known(F::zero()),
+                Value::known(F::from(access_list_address_size)),
+                Value::known(F::zero()),
+            ],
+            [
+                Value::known(F::from(self.id as u64)),
+                Value::known(F::from(TxContextFieldTag::AccessListStorageKeysLen as u64)),
+                Value::known(F::zero()),
+                Value::known(F::from(access_list_storage_key_size)),
+                Value::known(F::zero()),
+            ],
+            [
+                Value::known(F::from(self.id as u64)),
+                Value::known(F::from(TxContextFieldTag::AccessListRLC as u64)),
+                Value::known(F::zero()),
+                rlc_be_bytes(
+                    &self
+                        .access_list
+                        .as_ref()
+                        .map(|access_list| access_list.rlp_bytes())
+                        .unwrap_or_default(),
+                    challenges.keccak_input(),
+                ),
+                Value::known(F::zero()),
+            ],
+            [
+                Value::known(F::from(self.id as u64)),
+                Value::known(F::from(TxContextFieldTag::MaxFeePerGas as u64)),
+                Value::known(F::zero()),
+                challenges
+                    .evm_word()
+                    .map(|challenge| rlc::value(&self.max_fee_per_gas.to_le_bytes(), challenge)),
+                Value::known(F::zero()),
+            ],
+            [
+                Value::known(F::from(self.id as u64)),
+                Value::known(F::from(TxContextFieldTag::MaxPriorityFeePerGas as u64)),
+                Value::known(F::zero()),
+                challenges.evm_word().map(|challenge| {
+                    rlc::value(&self.max_priority_fee_per_gas.to_le_bytes(), challenge)
+                }),
+                Value::known(F::zero()),
             ],
             [
                 Value::known(F::from(self.id as u64)),
                 Value::known(F::from(TxContextFieldTag::BlockNumber as u64)),
                 Value::known(F::zero()),
                 Value::known(F::from(self.block_number)),
+                Value::known(F::zero()),
             ],
         ];
 
@@ -322,7 +400,7 @@ impl Transaction {
     pub fn table_assignments_dyn<F: Field>(
         &self,
         _challenges: Challenges<Value<F>>,
-    ) -> Vec<[Value<F>; 4]> {
+    ) -> Vec<[Value<F>; 5]> {
         self.call_data
             .iter()
             .enumerate()
@@ -332,9 +410,44 @@ impl Transaction {
                     Value::known(F::from(TxContextFieldTag::CallData as u64)),
                     Value::known(F::from(idx as u64)),
                     Value::known(F::from(*byte as u64)),
+                    Value::known(F::zero()),
                 ]
             })
             .collect()
+    }
+
+    /// Assignments for tx table access list
+    pub fn table_assignments_access_list_dyn<F: Field>(
+        &self,
+        challenges: Challenges<Value<F>>,
+    ) -> Vec<[Value<F>; 5]> {
+        let mut assignments: Vec<[Value<F>; 5]> = vec![];
+
+        if self.access_list.is_some() {
+            let mut sks_acc: usize = 0;
+            for (al_idx, al) in self.access_list.as_ref().unwrap().0.iter().enumerate() {
+                assignments.push([
+                    Value::known(F::from(self.id as u64)),
+                    Value::known(F::from(TxContextFieldTag::AccessListAddress as u64)),
+                    Value::known(F::from((al_idx + 1) as u64)),
+                    Value::known(al.address.to_scalar().unwrap()),
+                    Value::known(al.address.to_scalar().unwrap()),
+                ]);
+
+                for sk in al.storage_keys.iter() {
+                    sks_acc += 1;
+                    assignments.push([
+                        Value::known(F::from(self.id as u64)),
+                        Value::known(F::from(TxContextFieldTag::AccessListStorageKey as u64)),
+                        Value::known(F::from(sks_acc as u64)),
+                        rlc_be_bytes(&sk.to_fixed_bytes(), challenges.evm_word()),
+                        Value::known(al.address.to_scalar().unwrap()),
+                    ]);
+                }
+            }
+        }
+
+        assignments
     }
 
     pub(crate) fn gen_rlp_witness<F: Field>(
@@ -398,12 +511,28 @@ impl Transaction {
             byte_idx: 0,
             depth: 0,
         };
+
+        // Queue up stack operations
+        let mut stack_ops: Vec<RlpStackOp<F>> = vec![];
+        // This variable tracks how many bytes were left on a depth level before the last UPDATE.
+        // Unlike the remaining_bytes variable, it tracks the byte count before the UPDATE
+        // operation took place. This is a utility variable for correctly filling the
+        // value_prev field in a POP record.
+        let mut prev_bytes_on_depth: [usize; 4] = [0, 0, 0, 0];
+
         // When we are decoding a vector of element type `t`, at the beginning
         // we actually do not know the next tag is `EndVector` or not. After we
         // parsed the current tag, if the remaining bytes to decode in this layer
         // is zero, then the next tag is `EndVector`.
         let mut cur_rom_row = vec![0];
         let mut remaining_bytes = vec![rlp_bytes.len()];
+        // initialize stack
+        stack_ops.push(RlpStackOp::init(
+            tx_id,
+            format,
+            rlp_bytes.len(),
+            keccak_rand,
+        ));
         let mut witness_table_idx = 0;
 
         // This map keeps track
@@ -415,6 +544,10 @@ impl Transaction {
         let mut is_none;
         let mut rlp_tag;
         let mut lb_len = 0;
+        // These two variables keep track
+        // unique identifier of addresses and storage keys included in access list
+        let mut access_list_idx: u64 = 0;
+        let mut storage_key_idx: u64 = 0;
 
         loop {
             // default behavior
@@ -433,16 +566,45 @@ impl Transaction {
                                 .expect("remaining_bytes shall not be empty"),
                             0
                         );
+
                         if cur.depth == 1 {
                             assert_eq!(remaining_bytes.len(), 1);
                             assert_eq!(remaining_bytes[0], 0);
                             assert_eq!(cur.byte_idx, rlp_bytes.len() - 1);
                             is_output = true;
                             rlp_tag = RlpTag::RLC;
+                        } else if cur.depth == 4 {
+                            // end of storage keys list
+                            // note: depth alone currently is sufficient to ascertain
+                            // the end of a storage keys list as there's no other nested
+                            // structure at depth 4 specified in EIP standards
+                            storage_key_idx = 0;
+                        } else if cur.depth == 2 {
+                            // end of access list
+                            // note: depth alone currently is sufficient to ascertain
+                            // the end of an access list as there's no other nested
+                            // structure at depth 2 specified in EIP standards
+                            access_list_idx = 0;
                         } else if cur.depth == 0 {
                             // emit GasCost
                             is_output = true;
                             rlp_tag = RlpTag::GasCost;
+                        }
+
+                        if !remaining_bytes.is_empty() {
+                            let byte_remained = *remaining_bytes.last().unwrap();
+
+                            stack_ops.push(RlpStackOp::pop(
+                                tx_id,
+                                format,
+                                cur.byte_idx + 1,
+                                cur.depth - 1,
+                                byte_remained,
+                                prev_bytes_on_depth[cur.depth - 1],
+                                access_list_idx,
+                                storage_key_idx,
+                                keccak_rand,
+                            ));
                         }
 
                         // state transitions
@@ -453,11 +615,42 @@ impl Transaction {
                         next.state = DecodeTagStart;
                     } else {
                         let byte_value = rlp_bytes[cur.byte_idx];
+
+                        if byte_value > 0x80 && byte_value < 0xb8 {
+                            // detect start of access list address
+                            if cur.tag.is_access_list_address() {
+                                access_list_idx += 1;
+                            }
+                            // detect start of access list storage key
+                            if cur.tag.is_access_list_storage_key() {
+                                storage_key_idx += 1;
+                            }
+                        }
+
                         if let Some(rem) = remaining_bytes.last_mut() {
                             // read one more byte
                             assert!(*rem >= 1);
+
+                            if !(0xc0..=0xf7).contains(&byte_value) {
+                                // Note: if the byte_value is in the range [0xc0..=0xf7],
+                                // then we anticipate a PUSH onto a higher depth.
+
+                                // add stack op on same depth
+                                stack_ops.push(RlpStackOp::update(
+                                    tx_id,
+                                    format,
+                                    cur.byte_idx + 1,
+                                    cur.depth,
+                                    *rem - 1,
+                                    access_list_idx,
+                                    storage_key_idx,
+                                    keccak_rand,
+                                ));
+                            }
+
                             *rem -= 1;
                         }
+
                         if byte_value < 0x80 {
                             // assertions
                             assert!(!cur.tag.is_list());
@@ -518,9 +711,26 @@ impl Transaction {
                                 // current list should be subtracted by
                                 // the number of bytes of the new list.
                                 assert!(*rem >= num_bytes_of_new_list);
+                                prev_bytes_on_depth[cur.depth] = *rem + 1;
+
                                 *rem -= num_bytes_of_new_list;
                             }
                             remaining_bytes.push(num_bytes_of_new_list);
+
+                            let al_inc: u64 = if cur.depth == 2 { 1 } else { 0 };
+                            let sk_inc: u64 = if cur.depth == 3 { 1 } else { 0 };
+
+                            stack_ops.push(RlpStackOp::push(
+                                tx_id,
+                                format,
+                                cur.byte_idx + 1,
+                                cur.depth + 1,
+                                num_bytes_of_new_list,
+                                access_list_idx + al_inc,
+                                storage_key_idx + sk_inc,
+                                keccak_rand,
+                            ));
+
                             next.depth = cur.depth + 1;
                             next.state = DecodeTagStart;
                         } else {
@@ -540,6 +750,26 @@ impl Transaction {
                 State::Bytes => {
                     if let Some(rem) = remaining_bytes.last_mut() {
                         assert!(*rem >= 1);
+
+                        let sk_inc =
+                            if cur.depth == 4 && cur.tag_idx >= cur.tag_length && *rem - 1 > 0 {
+                                1
+                            } else {
+                                0
+                            };
+
+                        // add stack op on same depth
+                        stack_ops.push(RlpStackOp::update(
+                            tx_id,
+                            format,
+                            cur.byte_idx + 1,
+                            cur.depth,
+                            *rem - 1,
+                            access_list_idx,
+                            storage_key_idx + sk_inc,
+                            keccak_rand,
+                        ));
+
                         *rem -= 1;
                     }
                     if cur.tag_idx < cur.tag_length {
@@ -566,6 +796,19 @@ impl Transaction {
                 State::LongBytes => {
                     if let Some(rem) = remaining_bytes.last_mut() {
                         assert!(*rem >= 1);
+
+                        // add stack op on same depth
+                        stack_ops.push(RlpStackOp::update(
+                            tx_id,
+                            format,
+                            cur.byte_idx + 1,
+                            cur.depth,
+                            *rem - 1,
+                            access_list_idx,
+                            storage_key_idx,
+                            keccak_rand,
+                        ));
+
                         *rem -= 1;
                     }
 
@@ -590,6 +833,21 @@ impl Transaction {
                     if let Some(rem) = remaining_bytes.last_mut() {
                         // read one more byte
                         assert!(*rem >= 1);
+
+                        // add stack op on same depth
+                        if cur.tag_idx < cur.tag_length {
+                            stack_ops.push(RlpStackOp::update(
+                                tx_id,
+                                format,
+                                cur.byte_idx + 1,
+                                cur.depth,
+                                *rem - 1,
+                                access_list_idx,
+                                storage_key_idx,
+                                keccak_rand,
+                            ));
+                        }
+
                         *rem -= 1;
                     }
                     if cur.tag_idx < cur.tag_length {
@@ -605,9 +863,25 @@ impl Transaction {
                         }
                         if let Some(rem) = remaining_bytes.last_mut() {
                             assert!(*rem >= lb_len);
+                            prev_bytes_on_depth[cur.depth] = *rem + 1;
+
                             *rem -= lb_len;
                         }
                         remaining_bytes.push(lb_len);
+
+                        let al_inc: u64 = if cur.depth == 2 { 1 } else { 0 };
+                        let sk_inc: u64 = if cur.depth == 3 { 1 } else { 0 };
+
+                        stack_ops.push(RlpStackOp::push(
+                            tx_id,
+                            format,
+                            cur.byte_idx + 1,
+                            cur.depth + 1,
+                            lb_len,
+                            access_list_idx + al_inc,
+                            storage_key_idx + sk_inc,
+                            keccak_rand,
+                        ));
                         next.depth = cur.depth + 1;
                         next.state = DecodeTagStart;
                     }
@@ -644,7 +918,7 @@ impl Transaction {
                 cur_rom_row = rom_table[row].tag_next_idx.clone();
 
                 if next.tag.is_end() {
-                    // Since the EndList or EndVector tag does not read any byte from the data
+                    // Since the EndObject or EndVector tag does not read any byte from the data
                     // table.
                     next.byte_idx = cur.byte_idx;
                 } else {
@@ -685,6 +959,8 @@ impl Transaction {
                     tag_length,
                     is_output,
                     is_none,
+                    access_list_idx,
+                    storage_key_idx,
                 },
                 state_machine: StateMachine {
                     state: cur.state,
@@ -700,14 +976,53 @@ impl Transaction {
                     bytes_rlc,
                     gas_cost_acc,
                 },
+                // The stack operations will be later sorted and assigned
+                rlp_decoding_table: RlpStackOp::default(),
             });
+
             witness_table_idx += 1;
 
-            if cur.tag == EndList && cur.depth == 0 {
+            if cur.tag == EndObject && cur.depth == 0 {
                 break;
             }
             cur = next;
         }
+
+        assert_eq!(
+            stack_ops.len(),
+            witness.len(),
+            "Number of stack_ops must be equal to witness length"
+        );
+
+        // Sort the RlpStackOps and assign to the RlpDecodingTable part of witness
+        stack_ops.sort_by(|a, b| {
+            if (
+                a.tx_id,
+                a.format as u64,
+                a.depth,
+                a.al_idx,
+                a.sk_idx,
+                a.byte_idx,
+                a.stack_op.clone() as u64,
+            ) > (
+                b.tx_id,
+                b.format as u64,
+                b.depth,
+                a.al_idx,
+                a.sk_idx,
+                b.byte_idx,
+                b.stack_op.clone() as u64,
+            ) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        });
+
+        for (idx, op) in stack_ops.into_iter().enumerate() {
+            witness[idx].rlp_decoding_table = op;
+        }
+
         // filling up the `tag_next` col of the witness table
         let mut idx = 0;
         for (witness_idx, rom_table_row) in tag_rom_row_map {
@@ -723,12 +1038,13 @@ impl Transaction {
 
     #[cfg(test)]
     pub(crate) fn new_from_rlp_bytes(
+        tx_id: usize,
         tx_type: TxType,
         signed_bytes: Vec<u8>,
         unsigned_bytes: Vec<u8>,
     ) -> Self {
         Self {
-            id: 1,
+            id: tx_id,
             tx_type,
             rlp_signed: signed_bytes,
             rlp_unsigned: unsigned_bytes,
@@ -766,12 +1082,12 @@ impl<F: Field> RlpFsmWitnessGen<F> for Transaction {
         };
 
         log::debug!(
-            "{}th tx sign witness rows len = {}",
+            "tx (id: {}) sign witness rows len = {}",
             self.id,
             sign_wit.len()
         );
         log::debug!(
-            "{}th tx hash witness rows len = {}",
+            "tx (id: {}) tx hash witness rows len = {}",
             self.id,
             hash_wit.len()
         );
@@ -826,8 +1142,9 @@ impl<F: Field> RlpFsmWitnessGen<F> for Transaction {
     }
 }
 
-impl From<MockTransaction> for Transaction {
-    fn from(mock_tx: MockTransaction) -> Self {
+#[cfg(any(feature = "test", test))]
+impl From<mock::MockTransaction> for Transaction {
+    fn from(mock_tx: mock::MockTransaction) -> Self {
         let is_create = mock_tx.to.is_none();
         let sig = Signature {
             r: mock_tx.r.expect("tx expected to be signed"),
@@ -838,11 +1155,13 @@ impl From<MockTransaction> for Transaction {
             let mut legacy_tx = TransactionRequest::new()
                 .from(mock_tx.from.address())
                 .nonce(mock_tx.nonce)
-                .gas_price(mock_tx.gas_price)
                 .gas(mock_tx.gas)
                 .value(mock_tx.value)
                 .data(mock_tx.input.clone())
                 .chain_id(mock_tx.chain_id);
+            if let Some(gas_price) = mock_tx.gas_price {
+                legacy_tx = legacy_tx.gas_price(gas_price);
+            }
             if !is_create {
                 legacy_tx = legacy_tx.to(mock_tx.to.as_ref().map(|to| to.address()).unwrap());
             }
@@ -852,6 +1171,7 @@ impl From<MockTransaction> for Transaction {
 
             (unsigned, signed)
         };
+        let access_list = Some(mock_tx.access_list);
         Self {
             block_number: 1,
             id: mock_tx.transaction_index.as_usize(),
@@ -859,7 +1179,9 @@ impl From<MockTransaction> for Transaction {
             tx_type: TxType::Eip155,
             nonce: mock_tx.nonce.as_u64(),
             gas: mock_tx.gas.as_u64(),
-            gas_price: mock_tx.gas_price,
+            gas_price: mock_tx.gas_price.unwrap_or_default(),
+            max_fee_per_gas: mock_tx.max_fee_per_gas,
+            max_priority_fee_per_gas: mock_tx.max_priority_fee_per_gas,
             caller_address: mock_tx.from.address(),
             callee_address: mock_tx.to.as_ref().map(|to| to.address()),
             is_create,
@@ -867,6 +1189,7 @@ impl From<MockTransaction> for Transaction {
             call_data: mock_tx.input.to_vec(),
             call_data_length: mock_tx.input.len(),
             call_data_gas_cost: tx_data_gas_cost(&mock_tx.input),
+            access_list_gas_cost: tx_access_list_gas_cost(&access_list),
             tx_data_gas_cost: tx_data_gas_cost(&rlp_signed),
             chain_id: mock_tx.chain_id,
             rlp_unsigned,
@@ -876,6 +1199,7 @@ impl From<MockTransaction> for Transaction {
             s: sig.s,
             l1_fee: Default::default(),
             l1_fee_committed: Default::default(),
+            access_list,
             calls: vec![],
             steps: vec![],
         }
@@ -911,6 +1235,16 @@ pub(super) fn tx_convert(
         nonce: tx.nonce,
         gas: tx.gas,
         gas_price: tx.gas_price,
+        max_fee_per_gas: if tx.tx_type.is_eip1559() {
+            tx.gas_fee_cap
+        } else {
+            tx.gas_price
+        },
+        max_priority_fee_per_gas: if tx.tx_type.is_eip1559() {
+            tx.gas_tip_cap
+        } else {
+            tx.gas_price
+        },
         caller_address: tx.from,
         callee_address,
         is_create: tx.is_create(),
@@ -918,6 +1252,7 @@ pub(super) fn tx_convert(
         call_data: tx.input.clone(),
         call_data_length: tx.input.len(),
         call_data_gas_cost: tx_data_gas_cost(&tx.input),
+        access_list_gas_cost: tx_access_list_gas_cost(&tx.access_list),
         tx_data_gas_cost: tx_gas_cost,
         chain_id,
         rlp_unsigned: tx.rlp_unsigned_bytes.clone(),
@@ -927,6 +1262,7 @@ pub(super) fn tx_convert(
         s: tx.signature.s,
         l1_fee: tx.l1_fee,
         l1_fee_committed: tx.l1_fee_committed,
+        access_list: tx.access_list.clone(),
         calls: tx
             .calls()
             .iter()
@@ -959,13 +1295,18 @@ pub(super) fn tx_convert(
             .iter()
             .map(|step| step_convert(step, tx.block_num))
             .chain({
-                let rw_counter = tx.steps().last().unwrap().rwc.0 + 9 - (id == 1) as usize;
+                // TODO: it is a bit counter-intuitive to treat EndInnerBlock step, even multiple
+                // EndInnerBlock steps to belong to the last prev tx.
+                // We can change design later to make it easier to understand.
+                let last_step = tx.steps().last().unwrap();
+                let rw_counter = last_step.rwc.0 + last_step.bus_mapping_instance.len();
                 debug_assert!(next_block_num >= tx.block_num);
                 (tx.block_num..next_block_num)
                     .map(|block_num| ExecStep {
                         rw_counter,
                         execution_state: ExecutionState::EndInnerBlock,
                         block_num,
+                        call_index: last_step.call_index,
                         ..Default::default()
                     })
                     .collect::<Vec<ExecStep>>()
@@ -978,12 +1319,13 @@ pub(super) fn tx_convert(
 mod tests {
     use crate::witness::{tx::Challenges, RlpTag, Tag, Transaction};
     use eth_types::{
-        evm_types::gas_utils::tx_data_gas_cost, geth_types::TxType, Address, ToBigEndian, ToScalar,
+        evm_types::gas_utils::tx_data_gas_cost, geth_types::TxType, Address, ToBigEndian,
     };
     use ethers_core::{
         types::{Transaction as EthTransaction, TransactionRequest},
         utils::rlp::{Decodable, Rlp},
     };
+    use gadgets::ToScalar;
     use halo2_proofs::{circuit::Value, dev::unwrap_value, halo2curves::bn256::Fr};
 
     fn rlc(be_bytes: &[u8], rand: Fr) -> Fr {
@@ -1025,7 +1367,7 @@ mod tests {
 
         let to = eth_tx.to.map_or(Address::zero(), |to| to);
         let data = eth_tx.input.to_vec();
-        let tx_table = vec![
+        let tx_table = [
             rlc(&eth_tx.nonce.to_be_bytes(), evm_word),
             rlc(&eth_tx.gas_price.unwrap().to_be_bytes(), evm_word),
             Fr::from(eth_tx.gas.as_u64()),
@@ -1094,7 +1436,7 @@ mod tests {
 
         let to = eth_tx.to.map_or(Address::zero(), |to| to);
         let data = eth_tx.input.to_vec();
-        let tx_table = vec![
+        let tx_table = [
             rlc(&eth_tx.nonce.to_be_bytes(), evm_word),
             Fr::from(eth_tx.gas.as_u64()),
             to.to_scalar().unwrap(),

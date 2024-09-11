@@ -15,7 +15,7 @@ The EVM Circuit needs to lookup to the bytecode table that stores the correct by
 |RLC of hash's little-endian bytes using evm_word randomness|BytecodeFieldTag::Header|0|0|len of bytes|
 |RLC of hash's little-endian bytes using evm_word randomness|BytecodeFieldTag::Byte|idx|true when the byte is not an argument to a PUSHx instruction|byte|
 
-Here `Header` is used to seperate bytecodes.
+Here `Header` is used to separate bytecodes.
 
 ## Purpose of the Bytecode Circuit
 
@@ -29,7 +29,7 @@ The bytecode circuit aims at constraining the correctness of the above bytecode 
 
 ## Architecture and Design
 
-Raw `bytes` with the Keccak codehash of it `code_hash=keccak(&bytes[...])` are feed into `unroll_with_codehash` that runs over all the bytes and unroll them into `UnrolledBytecode{bytes, rows}`, which fits the bytecode table layout. This means each row contains `(code_hash, tag, index, is_code, value)`. (The only difference is that here `code_hash` is not RLCed yet.) Notice that only `PUSHx` will be followed by non-instruction bytes, so `is_code = push_rindex==0`, i.e. `unroll_with_codehash` computes `push_rindex` that decays from push size to zero and when it is zero it means the byte is an instruction code. With `UnrolledBytecode`, we contrain its rows via `BytecodeCircuit`, so the architecture looks like
+Raw `bytes` with the Keccak codehash of it `code_hash=keccak(&bytes[...])` are feed into `unroll_with_codehash` that runs over all the bytes and unroll them into `UnrolledBytecode{bytes, rows}`, which fits the bytecode table layout. This means each row contains `(code_hash, tag, index, is_code, value)`. (The only difference is that here `code_hash` is not RLCed yet.) Notice that only `PUSHx` will be followed by non-instruction bytes, so `is_code = push_rindex==0`, i.e. `unroll_with_codehash` computes `push_rindex` that decays from push size to zero and when it is zero it means the byte is an instruction code. With `UnrolledBytecode`, we constrain its rows via `BytecodeCircuit`, so the architecture looks like
 
 ```mermaid
 stateDiagram
@@ -98,5 +98,5 @@ Here
     - when `tag` is `byte`, then lookup to push_table for `(value, push_data_size)`
 
 - correct propagation of each row within one bytecode
-    - when `tag` transits from `byte` to `byte`, then `length` and `hash` remain the same, `index` increse by 1, `value_rlc` accumulates, and for push data `push_data_left` decay by 1, for code `push_data_left` remains the same as `push_data_size`
+    - when `tag` transits from `byte` to `byte`, then `length` and `hash` remain the same, `index` increases by 1, `value_rlc` accumulates, and for push data `push_data_left` decay by 1, for code `push_data_left` remains the same as `push_data_size`
 

@@ -2,16 +2,15 @@
 use crate::{
     bytecode_circuit::bytecode_unroller::HASHBLOCK_BYTES_IN_FIELD,
     table::PoseidonTable,
-    util::{Challenges, SubCircuit, SubCircuitConfig},
+    util::{Challenges, Field, SubCircuit, SubCircuitConfig},
     witness::{self},
 };
-//use bus_mapping::state_db::CodeDB;
-use eth_types::Field;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{Circuit, ConstraintSystem, Error},
 };
-use hash_circuit::hash::{Hashable, PoseidonHashChip, PoseidonHashConfig, PoseidonHashTable};
+pub use hash_circuit::hash::Hashable;
+use hash_circuit::hash::{PoseidonHashChip, PoseidonHashConfig, PoseidonHashTable};
 
 /// re-wrapping for mpt circuit
 #[derive(Default, Clone, Debug)]
@@ -27,7 +26,8 @@ pub struct PoseidonCircuitConfigArgs {
 #[derive(Debug, Clone)]
 pub struct PoseidonCircuitConfig<F: Field>(pub(crate) PoseidonHashConfig<F>);
 
-const HASH_BLOCK_STEP_SIZE: usize = HASHBLOCK_BYTES_IN_FIELD * PoseidonTable::INPUT_WIDTH;
+/// How many bytes a poseidon round can consume.
+pub const HASH_BLOCK_STEP_SIZE: usize = HASHBLOCK_BYTES_IN_FIELD * PoseidonTable::INPUT_WIDTH;
 
 impl<F: Field> SubCircuitConfig<F> for PoseidonCircuitConfig<F> {
     type ConfigArgs = PoseidonCircuitConfigArgs;
@@ -52,11 +52,10 @@ impl<F: Field> SubCircuitConfig<F> for PoseidonCircuitConfig<F> {
     }
 }
 
-#[cfg(any(feature = "test", test))]
 impl<F: Field> SubCircuit<F> for PoseidonCircuit<F> {
     type Config = PoseidonCircuitConfig<F>;
 
-    fn new_from_block(block: &witness::Block<F>) -> Self {
+    fn new_from_block(block: &witness::Block) -> Self {
         let max_hashes = block.circuits_params.max_poseidon_rows / F::hash_block_size();
         #[allow(unused_mut)]
         let mut poseidon_table_data: PoseidonHashTable<F> = PoseidonHashTable::default();
@@ -93,7 +92,7 @@ impl<F: Field> SubCircuit<F> for PoseidonCircuit<F> {
         Self(poseidon_table_data, max_hashes)
     }
 
-    fn min_num_rows_block(block: &witness::Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &witness::Block) -> (usize, usize) {
         let mut path_hash_counter: std::collections::HashMap<[u8; 32], usize> = Default::default();
         let mut account_counter: std::collections::HashMap<[u8; 32], usize> = Default::default();
         let mut storage_counter: std::collections::HashMap<[u8; 32], usize> = Default::default();
@@ -102,7 +101,7 @@ impl<F: Field> SubCircuit<F> for PoseidonCircuit<F> {
             *map.entry(k).or_insert(0) += 1;
         };
         for smt_trace in &block.mpt_updates.smt_traces {
-            // for a smt trace there are mutiple sources for hashes:
+            // for a smt trace there are multiple sources for hashes:
             // + account path, each layer (include the root) cost 1 hashes
             insert(&mut path_hash_counter, smt_trace.account_path[0].root.0);
             for node in &smt_trace.account_path[0].path {
@@ -171,6 +170,11 @@ impl<F: Field> SubCircuit<F> for PoseidonCircuit<F> {
             * F::hash_block_size();
         let total_row_num = mpt_row_num + byte_row_num;
         log::debug!("poseidon circuit row num: {mpt_row_num}(mpt) + {byte_row_num}(bytecode) = {total_row_num}");
+        let avg_trie_depth = after_dedup_size / block.mpt_updates.len();
+        log::debug!(
+            "avg_trie_depth {avg_trie_depth}, hash num {after_dedup_size}, mpt update num {}",
+            block.mpt_updates.len()
+        );
         (
             total_row_num,
             block.circuits_params.max_poseidon_rows.max(total_row_num),
@@ -204,6 +208,8 @@ impl<F: Field> SubCircuit<F> for PoseidonCircuit<F> {
 impl<F: Field + Hashable> Circuit<F> for PoseidonCircuit<F> {
     type Config = (PoseidonCircuitConfig<F>, Challenges);
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self(Default::default(), self.1)
@@ -231,10 +237,10 @@ impl<F: Field + Hashable> Circuit<F> for PoseidonCircuit<F> {
 
 #[cfg(feature = "zktrie")]
 fn get_storage_poseidon_witness<F: Field>(
-    block: &crate::witness::Block<F>,
+    block: &crate::witness::Block,
 ) -> Vec<([F; 2], F, Option<F>)> {
     use itertools::Itertools;
-    use mpt_zktrie::mpt_circuits::{gadgets::mpt_update::hash_traces, types::Proof};
+    use mpt_circuits::{gadgets::mpt_update::hash_traces, types::Proof};
     hash_traces(
         &block
             .mpt_updates

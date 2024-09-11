@@ -16,7 +16,8 @@ use crate::{
     util::Expr,
 };
 
-use eth_types::{evm_types::OpcodeId, Field, ToLittleEndian};
+use crate::util::Field;
+use eth_types::{evm_types::OpcodeId, ToLittleEndian};
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 /// Gadget for code store oog and max code size exceed
@@ -102,7 +103,7 @@ impl<F: Field> ExecutionGadget<F> for ErrorInvalidCreationCodeGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _tx: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -157,16 +158,15 @@ mod test {
     use eth_types::{
         address, bytecode, evm_types::OpcodeId, geth_types::Account, Address, Bytecode, Word,
     };
+    use std::sync::LazyLock;
 
-    use lazy_static::lazy_static;
     use mock::{eth, TestContext, MOCK_ACCOUNTS};
 
     use crate::test_util::CircuitTestBuilder;
 
     const CALLEE_ADDRESS: Address = Address::repeat_byte(0xff);
-    lazy_static! {
-        static ref CALLER_ADDRESS: Address = address!("0x00bbccddee000000000000000000000000002400");
-    }
+    static CALLER_ADDRESS: LazyLock<Address> =
+        LazyLock::new(|| address!("0x00bbccddee000000000000000000000000002400"));
 
     const MAXCODESIZE: u64 = 0x6000u64;
 
@@ -179,7 +179,7 @@ mod test {
             .run();
     }
 
-    fn initialization_bytecode() -> Bytecode {
+    fn get_initcode() -> Bytecode {
         let memory_bytes = [0xef; 10];
         let memory_value = Word::from_big_endian(&memory_bytes);
 
@@ -197,8 +197,8 @@ mod test {
         code
     }
 
-    fn creator_bytecode(initialization_bytecode: Bytecode, is_create2: bool) -> Bytecode {
-        let initialization_bytes = initialization_bytecode.code();
+    fn creator_bytecode(get_initcode: Bytecode, is_create2: bool) -> Bytecode {
+        let initialization_bytes = get_initcode.code();
         let mut code = Bytecode::default();
 
         // construct maxcodesize + 1 memory bytes
@@ -259,8 +259,8 @@ mod test {
     #[test]
     fn test_invalid_creation_code() {
         for is_create2 in [false, true] {
-            let initialization_code = initialization_bytecode();
-            let root_code = creator_bytecode(initialization_code, is_create2);
+            let initcode = get_initcode();
+            let root_code = creator_bytecode(initcode, is_create2);
             let caller = Account {
                 address: *CALLER_ADDRESS,
                 code: root_code.into(),
@@ -275,7 +275,7 @@ mod test {
     // add tx deploy case for invalid creation code.
     #[test]
     fn test_tx_deploy_invalid_creation_code() {
-        let code = initialization_bytecode();
+        let code = get_initcode();
 
         let ctx = TestContext::<1, 1>::new(
             None,

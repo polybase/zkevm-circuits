@@ -1,12 +1,11 @@
 //! Mock types and functions to generate mock data useful for tests
 
-use crate::{
-    circuit_input_builder::{
-        get_state_accesses, AccessSet, Block, BlockHead, CircuitInputBuilder, CircuitsParams,
-    },
+use crate::circuit_input_builder::{AccessSet, Block, Blocks, CircuitInputBuilder, CircuitsParams};
+use eth_types::{
+    geth_types::GethData,
     state_db::{self, CodeDB, StateDB},
+    ToWord, Word, H256,
 };
-use eth_types::{geth_types::GethData, ToWord, Word, H256};
 use ethers_core::utils::keccak256;
 
 const MOCK_OLD_STATE_ROOT: u64 = 0xcafeu64;
@@ -22,7 +21,7 @@ pub struct BlockData {
     /// chain id
     pub chain_id: u64,
     /// history hashes contains most recent 256 block hashes in history, where
-    /// the lastest one is at history_hashes[history_hashes.len() - 1].
+    /// the latest one is at history_hashes[history_hashes.len() - 1].
     pub history_hashes: Vec<Word>,
     /// Block from geth
     pub eth_block: eth_types::Block<eth_types::Transaction>,
@@ -36,17 +35,13 @@ impl BlockData {
     /// Generate a new CircuitInputBuilder initialized with the context of the
     /// BlockData.
     pub fn new_circuit_input_builder(&self) -> CircuitInputBuilder {
-        let mut block = Block::from_headers(
-            &[
-                BlockHead::new(self.chain_id, self.history_hashes.clone(), &self.eth_block)
-                    .unwrap(),
-            ],
-            Default::default(),
-        );
+        let header =
+            Block::new(self.chain_id, self.history_hashes.clone(), &self.eth_block).unwrap();
+        let mut block = Blocks::init(self.chain_id, Default::default());
+        block.blocks.insert(header.number.as_u64(), header);
         // FIXME: better fetch a real state root instead of a mock one
-        block.prev_state_root = MOCK_OLD_STATE_ROOT.into();
+        block.prev_state_root = H256::from_low_u64_be(MOCK_OLD_STATE_ROOT);
         block.circuits_params = self.circuits_params;
-        block.chain_id = self.chain_id;
         CircuitInputBuilder::new(self.sdb.clone(), self.code_db.clone(), &block)
     }
     /// Create a new block from the given Geth data.
@@ -57,10 +52,7 @@ impl BlockData {
         let mut sdb = StateDB::new();
         let mut code_db = CodeDB::new();
 
-        let access_set: AccessSet =
-            get_state_accesses(&geth_data.eth_block, &geth_data.geth_traces)
-                .expect("state accesses")
-                .into();
+        let access_set = AccessSet::from_geth_data(&geth_data);
         // Initialize all accesses accounts to zero
         for addr in access_set.state.keys() {
             sdb.set_account(addr, state_db::Account::zero());

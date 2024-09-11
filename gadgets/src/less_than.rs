@@ -1,8 +1,7 @@
 //! Lt chip can be used to compare LT for two expressions LHS and RHS.
 
-use eth_types::Field;
+use crate::Field;
 use halo2_proofs::{
-    arithmetic::FieldExt,
     circuit::{Chip, Region, Value},
     plonk::{Advice, Column, ConstraintSystem, Error, Expression, TableColumn, VirtualCells},
     poly::Rotation,
@@ -14,7 +13,7 @@ use crate::{
 };
 
 /// Instruction that the Lt chip needs to implement.
-pub trait LtInstruction<F: FieldExt> {
+pub trait LtInstruction<F: Field> {
     /// Assign the lhs and rhs witnesses to the Lt chip's region.
     fn assign(
         &self,
@@ -45,13 +44,12 @@ pub struct LtConfig<F, const N_BYTES: usize> {
 
 impl<F: Field, const N_BYTES: usize> LtConfig<F, N_BYTES> {
     /// Returns an expression that denotes whether lhs < rhs, or not.
-    pub fn is_lt(&self, meta: &mut VirtualCells<F>, rotation: Option<Rotation>) -> Expression<F> {
-        meta.query_advice(self.lt, rotation.unwrap_or_else(Rotation::cur))
+    pub fn is_lt(&self, meta: &mut VirtualCells<F>, rotation: Rotation) -> Expression<F> {
+        meta.query_advice(self.lt, rotation)
     }
 
     /// Returns an expression representing the difference between LHS and RHS.
-    pub fn diff(&self, meta: &mut VirtualCells<F>, rotation: Option<Rotation>) -> Expression<F> {
-        let rotation = rotation.unwrap_or_else(Rotation::cur);
+    pub fn diff(&self, meta: &mut VirtualCells<F>, rotation: Rotation) -> Expression<F> {
         sum::expr(self.diff.iter().map(|c| meta.query_advice(*c, rotation)))
     }
 }
@@ -136,7 +134,7 @@ impl<F: Field, const N_BYTES: usize> LtInstruction<F> for LtChip<F, N_BYTES> {
             || Value::known(F::from(lt as u64)),
         )?;
 
-        let diff = (lhs - rhs) + (if lt { config.range } else { F::zero() });
+        let diff = (lhs - rhs) + (if lt { config.range } else { F::ZERO });
         let diff_bytes = diff.to_repr();
         for (idx, diff_column) in config.diff.iter().enumerate() {
             region.assign_advice(
@@ -190,9 +188,8 @@ impl<F: Field, const N_BYTES: usize> Chip<F> for LtChip<F, N_BYTES> {
 #[cfg(test)]
 mod test {
     use super::{LtChip, LtConfig, LtInstruction};
-    use eth_types::Field;
+    use crate::Field;
     use halo2_proofs::{
-        arithmetic::FieldExt,
         circuit::{Layouter, SimpleFloorPlanner, Value},
         dev::MockProver,
         halo2curves::bn256::Fr as Fp,
@@ -246,7 +243,7 @@ mod test {
         }
 
         #[derive(Default)]
-        struct TestCircuit<F: FieldExt> {
+        struct TestCircuit<F: Field> {
             values: Option<Vec<u64>>,
             // checks[i] = lt(values[i + 1], values[i])
             checks: Option<Vec<bool>>,
@@ -256,6 +253,8 @@ mod test {
         impl<F: Field> Circuit<F> for TestCircuit<F> {
             type Config = TestCircuitConfig<F>;
             type FloorPlanner = SimpleFloorPlanner;
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
 
             fn without_witnesses(&self) -> Self {
                 Self::default()
@@ -288,7 +287,7 @@ mod test {
                     // This verifies lt(value::cur, value::next) is calculated correctly
                     let check = meta.query_advice(config.check, Rotation::cur());
 
-                    vec![q_enable * (config.lt.is_lt(meta, None) - check)]
+                    vec![q_enable * (config.lt.is_lt(meta, Rotation::cur()) - check)]
                 });
 
                 config
@@ -368,7 +367,7 @@ mod test {
         }
 
         #[derive(Default)]
-        struct TestCircuit<F: FieldExt> {
+        struct TestCircuit<F: Field> {
             values: Option<Vec<(u64, u64)>>,
             // checks[i] = lt(values[i].0 - values[i].1)
             checks: Option<Vec<bool>>,
@@ -378,6 +377,8 @@ mod test {
         impl<F: Field> Circuit<F> for TestCircuit<F> {
             type Config = TestCircuitConfig<F>;
             type FloorPlanner = SimpleFloorPlanner;
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
 
             fn without_witnesses(&self) -> Self {
                 Self::default()
@@ -411,7 +412,7 @@ mod test {
                     // This verifies lt(lhs, rhs) is calculated correctly
                     let check = meta.query_advice(config.check, Rotation::cur());
 
-                    vec![q_enable * (config.lt.is_lt(meta, None) - check)]
+                    vec![q_enable * (config.lt.is_lt(meta, Rotation::cur()) - check)]
                 });
 
                 config

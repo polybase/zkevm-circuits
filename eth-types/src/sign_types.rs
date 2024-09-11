@@ -3,37 +3,35 @@
 use crate::{
     address,
     geth_types::{Transaction, TxType},
-    word, ToBigEndian, Word, H256,
+    word, Error, Word, H256,
 };
 use ethers_core::{
-    k256::ecdsa::SigningKey,
+    k256::{
+        ecdsa::{RecoveryId, Signature as K256Signature, SigningKey, VerifyingKey},
+        elliptic_curve::{consts::U32, sec1::ToEncodedPoint},
+        PublicKey as K256PublicKey,
+    },
     types::{Address, Bytes, Signature, TransactionRequest, U256},
     utils::keccak256,
 };
-use halo2_proofs::{
-    arithmetic::{CurveAffine, FieldExt},
-    halo2curves::{
-        group::{
-            ff::{Field as GroupField, PrimeField},
-            prime::PrimeCurveAffine,
-            Curve,
-        },
-        secp256k1::{self, Secp256k1Affine},
-        Coordinates,
+use halo2curves::{
+    ff::FromUniformBytes,
+    group::{
+        ff::{Field as GroupField, PrimeField},
+        prime::PrimeCurveAffine,
+        Curve,
     },
+    secp256k1::{Fp, Fq, Secp256k1Affine},
+    Coordinates, CurveAffine,
 };
-use lazy_static::lazy_static;
 use num_bigint::BigUint;
+use sha3::digest::generic_array::GenericArray;
+use std::sync::LazyLock;
 use subtle::CtOption;
 
 /// Do a secp256k1 signature with a given randomness value.
-pub fn sign(
-    randomness: secp256k1::Fq,
-    sk: secp256k1::Fq,
-    msg_hash: secp256k1::Fq,
-) -> (secp256k1::Fq, secp256k1::Fq, u8) {
-    let randomness_inv =
-        Option::<secp256k1::Fq>::from(randomness.invert()).expect("cannot invert randomness");
+pub fn sign(randomness: Fq, sk: Fq, msg_hash: Fq) -> (Fq, Fq, u8) {
+    let randomness_inv = Option::<Fq>::from(randomness.invert()).expect("cannot invert randomness");
     let generator = Secp256k1Affine::generator();
     let sig_point = generator * randomness;
     let sig_v: bool = sig_point.to_affine().y.is_odd().into();
@@ -45,7 +43,7 @@ pub fn sign(
     let mut x_bytes = [0u8; 64];
     x_bytes[..32].copy_from_slice(&x.to_bytes());
 
-    let sig_r = secp256k1::Fq::from_bytes_wide(&x_bytes); // get x cordinate (E::Base) on E::Scalar
+    let sig_r = Fq::from_uniform_bytes(&x_bytes); // get x cordinate (E::Base) on E::Scalar
 
     let sig_s = randomness_inv * (msg_hash + sig_r * sk);
     (sig_r, sig_s, u8::from(sig_v))
@@ -57,13 +55,13 @@ pub fn sign(
 pub struct SignData {
     /// Secp256k1 signature point (r, s, v)
     /// v must be 0 or 1
-    pub signature: (secp256k1::Fq, secp256k1::Fq, u8),
+    pub signature: (Fq, Fq, u8),
     /// Secp256k1 public key
     pub pk: Secp256k1Affine,
     /// Message being hashed before signing.
     pub msg: Bytes,
     /// Hash of the message that is being signed
-    pub msg_hash: secp256k1::Fq,
+    pub msg_hash: Fq,
 }
 
 /// Generate a dummy pre-eip155 tx in which
@@ -104,39 +102,35 @@ pub fn get_dummy_tx() -> (TransactionRequest, Signature) {
 impl SignData {
     /// Recover address of the signature
     pub fn get_addr(&self) -> Address {
-        if self.pk == Secp256k1Affine::identity() {
+        if self.pk.is_identity().into() {
             return Address::zero();
         }
-        let pk_le = pk_bytes_le(&self.pk);
-        let pk_be = pk_bytes_swap_endianness(&pk_le);
-        let pk_hash = keccak256(pk_be);
-        let mut addr_bytes = [0u8; 20];
-        addr_bytes.copy_from_slice(&pk_hash[12..]);
-        Address::from_slice(&addr_bytes)
+        let pk_hash = keccak256(pk_bytes_swap_endianness(&pk_bytes_le(&self.pk)));
+        Address::from_slice(&pk_hash[12..])
     }
 }
 
-lazy_static! {
-    /// This is the sign data of default padding tx
-    static ref SIGN_DATA_DEFAULT: SignData = {
-        let (tx_req, sig) = get_dummy_tx();
-        let tx = Transaction {
-            tx_type: TxType::PreEip155,
-            rlp_unsigned_bytes: tx_req.rlp_unsigned().to_vec(),
-            rlp_bytes: tx_req.rlp_signed(&sig).to_vec(),
-            v: sig.v,
-            r: sig.r,
-            s: sig.s,
-            // other fields are irrelevant to get the sign_data()
-            ..Default::default()
-        };
-
-        let sign_data = tx.sign_data().unwrap();
-        assert_eq!(sign_data.get_addr(), address!("0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"));
-
-        sign_data
+static SIGN_DATA_DEFAULT: LazyLock<SignData> = LazyLock::new(|| {
+    let (tx_req, sig) = get_dummy_tx();
+    let tx = Transaction {
+        tx_type: TxType::PreEip155,
+        rlp_unsigned_bytes: tx_req.rlp_unsigned().to_vec(),
+        rlp_bytes: tx_req.rlp_signed(&sig).to_vec(),
+        v: sig.v,
+        r: sig.r,
+        s: sig.s,
+        // other fields are irrelevant to get the sign_data()
+        ..Default::default()
     };
-}
+
+    let sign_data = tx.sign_data().unwrap();
+    assert_eq!(
+        sign_data.get_addr(),
+        address!("0x7e5f4552091a69125d5dfcb7b8c2659029395bdf")
+    );
+
+    sign_data
+});
 
 impl Default for SignData {
     // Hardcoded valid signature corresponding to a hardcoded private key and
@@ -158,40 +152,51 @@ pub fn biguint_to_32bytes_le(v: BigUint) -> [u8; 32] {
 }
 
 /// Recover the public key from a secp256k1 signature and the message hash.
-pub fn recover_pk(
+pub fn recover_pk2(
     v: u8,
     r: &Word,
     s: &Word,
     msg_hash: &[u8; 32],
-) -> Result<Secp256k1Affine, libsecp256k1::Error> {
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes[..32].copy_from_slice(&r.to_be_bytes());
-    sig_bytes[32..].copy_from_slice(&s.to_be_bytes());
-    let signature = libsecp256k1::Signature::parse_standard(&sig_bytes)?;
-    let msg_hash = libsecp256k1::Message::parse_slice(msg_hash.as_slice())?;
-    let recovery_id = libsecp256k1::RecoveryId::parse(v)?;
-    let pk = libsecp256k1::recover(&msg_hash, &signature, &recovery_id)?;
-    let pk_be = pk.serialize();
-    let pk_le = pk_bytes_swap_endianness(&pk_be[1..]);
+) -> Result<Secp256k1Affine, Error> {
+    debug_assert!(v == 0 || v == 1, "recovery ID (v) is boolean");
+    let mut recoverable_sig = {
+        let mut r_bytes = [0u8; 32];
+        let mut s_bytes = [0u8; 32];
+        r.to_big_endian(&mut r_bytes);
+        s.to_big_endian(&mut s_bytes);
+        let gar: &GenericArray<u8, U32> = GenericArray::from_slice(&r_bytes);
+        let gas: &GenericArray<u8, U32> = GenericArray::from_slice(&s_bytes);
+        K256Signature::from_scalars(*gar, *gas).map_err(|_| Error::Signature)?
+    };
+    let mut v = v;
+    if let Some(sig_normalized) = recoverable_sig.normalize_s() {
+        recoverable_sig = sig_normalized;
+        v ^= 1;
+    };
+    let recovery_id = RecoveryId::from_byte(v).expect("normalized recovery id always valid");
+    let verify_key =
+        VerifyingKey::recover_from_prehash(msg_hash.as_ref(), &recoverable_sig, recovery_id)
+            .map_err(|_| Error::Signature)?;
+    let public_key = K256PublicKey::from(&verify_key);
+    let public_key = public_key.to_encoded_point(/* compress = */ false);
+    let public_key = public_key.as_bytes();
+    debug_assert_eq!(public_key[0], 0x04);
+    let pk_le = pk_bytes_swap_endianness(&public_key[1..]);
     let x = ct_option_ok_or(
-        secp256k1::Fp::from_bytes(pk_le[..32].try_into().unwrap()),
-        libsecp256k1::Error::InvalidPublicKey,
+        Fp::from_bytes(pk_le[..32].try_into().unwrap()),
+        Error::Signature,
     )?;
     let y = ct_option_ok_or(
-        secp256k1::Fp::from_bytes(pk_le[32..].try_into().unwrap()),
-        libsecp256k1::Error::InvalidPublicKey,
+        Fp::from_bytes(pk_le[32..].try_into().unwrap()),
+        Error::Signature,
     )?;
-    ct_option_ok_or(
-        Secp256k1Affine::from_xy(x, y),
-        libsecp256k1::Error::InvalidPublicKey,
-    )
+    ct_option_ok_or(Secp256k1Affine::from_xy(x, y), Error::Signature)
 }
 
-lazy_static! {
-    /// Secp256k1 Curve Scalar.  Referece: Section 2.4.1 (parameter `n`) in "SEC 2: Recommended
-    /// Elliptic Curve Domain Parameters" document at http://www.secg.org/sec2-v2.pdf
-    pub static ref SECP256K1_Q: BigUint = BigUint::from_bytes_le(&(secp256k1::Fq::zero() - secp256k1::Fq::one()).to_repr()) + 1u64;
-}
+/// Secp256k1 Curve Scalar.  Reference: Section 2.4.1 (parameter `n`) in "SEC 2: Recommended
+/// Elliptic Curve Domain Parameters" document at http://www.secg.org/sec2-v2.pdf
+pub static SECP256K1_Q: LazyLock<BigUint> =
+    LazyLock::new(|| BigUint::from_bytes_le(&(Fq::zero() - Fq::one()).to_repr()) + 1u64);
 
 /// Helper function to convert a `CtOption` into an `Result`.  Similar to
 /// `Option::ok_or`.

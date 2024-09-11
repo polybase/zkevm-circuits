@@ -23,16 +23,16 @@ use crate::{
     evm_circuit::param::{MAX_STEP_HEIGHT, STEP_STATE_HEIGHT},
     table::{
         BlockTable, BytecodeTable, CopyTable, EccTable, ExpTable, KeccakTable, LookupTable,
-        ModExpTable, PowOfRandTable, RwTable, SigTable, TxTable,
+        ModExpTable, PowOfRandTable, RwTable, SHA256Table, SigTable, TxTable,
     },
-    util::{SubCircuit, SubCircuitConfig},
+    util::{Field, SubCircuit, SubCircuitConfig},
 };
 use bus_mapping::evm::OpcodeId;
-use eth_types::Field;
 use execution::ExecutionConfig;
 use itertools::Itertools;
 use strum::IntoEnumIterator;
 use table::FixedTableTag;
+pub use util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon};
 use witness::Block;
 
 /// EvmCircuitConfig implements verification of execution trace of a block.
@@ -45,14 +45,17 @@ pub struct EvmCircuitConfig<F> {
     tx_table: TxTable,
     rw_table: RwTable,
     bytecode_table: BytecodeTable,
+    #[cfg(feature = "dual-bytecode")]
+    bytecode_table1: BytecodeTable,
     block_table: BlockTable,
     copy_table: CopyTable,
     keccak_table: KeccakTable,
+    sha256_table: SHA256Table,
     exp_table: ExpTable,
     sig_table: SigTable,
     modexp_table: ModExpTable,
     ecc_table: EccTable,
-    pow_of_rand_table: PowOfRandTable,
+    pub(crate) pow_of_rand_table: PowOfRandTable,
 }
 
 /// Circuit configuration arguments
@@ -65,12 +68,17 @@ pub struct EvmCircuitConfigArgs<F: Field> {
     pub rw_table: RwTable,
     /// BytecodeTable
     pub bytecode_table: BytecodeTable,
+    #[cfg(feature = "dual-bytecode")]
+    /// BytecodeTable
+    pub bytecode_table1: BytecodeTable,
     /// BlockTable
     pub block_table: BlockTable,
     /// CopyTable
     pub copy_table: CopyTable,
     /// KeccakTable
     pub keccak_table: KeccakTable,
+    /// SHA256Table
+    pub sha256_table: SHA256Table,
     /// ExpTable
     pub exp_table: ExpTable,
     /// SigTable
@@ -102,9 +110,12 @@ impl<F: Field> SubCircuitConfig<F> for EvmCircuitConfig<F> {
             tx_table,
             rw_table,
             bytecode_table,
+            #[cfg(feature = "dual-bytecode")]
+            bytecode_table1,
             block_table,
             copy_table,
             keccak_table,
+            sha256_table,
             exp_table,
             sig_table,
             modexp_table,
@@ -122,9 +133,12 @@ impl<F: Field> SubCircuitConfig<F> for EvmCircuitConfig<F> {
             &tx_table,
             &rw_table,
             &bytecode_table,
+            #[cfg(feature = "dual-bytecode")]
+            &bytecode_table1,
             &block_table,
             &copy_table,
             &keccak_table,
+            &sha256_table,
             &exp_table,
             &sig_table,
             &modexp_table,
@@ -139,6 +153,8 @@ impl<F: Field> SubCircuitConfig<F> for EvmCircuitConfig<F> {
         tx_table.annotate_columns(meta);
         rw_table.annotate_columns(meta);
         bytecode_table.annotate_columns(meta);
+        #[cfg(feature = "dual-bytecode")]
+        bytecode_table1.annotate_columns(meta);
         block_table.annotate_columns(meta);
         copy_table.annotate_columns(meta);
         keccak_table.annotate_columns(meta);
@@ -155,9 +171,12 @@ impl<F: Field> SubCircuitConfig<F> for EvmCircuitConfig<F> {
             tx_table,
             rw_table,
             bytecode_table,
+            #[cfg(feature = "dual-bytecode")]
+            bytecode_table1,
             block_table,
             copy_table,
             keccak_table,
+            sha256_table,
             exp_table,
             sig_table,
             modexp_table,
@@ -215,14 +234,14 @@ impl<F: Field> EvmCircuitConfig<F> {
 #[derive(Clone, Default, Debug)]
 pub struct EvmCircuit<F: Field> {
     /// Block
-    pub block: Option<Block<F>>,
+    pub block: Option<Block>,
     fixed_table_tags: Vec<FixedTableTag>,
     pub(crate) exports: std::cell::RefCell<Option<EvmCircuitExports<Assigned<F>>>>,
 }
 
 impl<F: Field> EvmCircuit<F> {
     /// Return a new EvmCircuit
-    pub fn new(block: Block<F>) -> Self {
+    pub fn new(block: Block) -> Self {
         Self {
             block: Some(block),
             fixed_table_tags: FixedTableTag::iter().collect(),
@@ -230,7 +249,7 @@ impl<F: Field> EvmCircuit<F> {
         }
     }
 
-    pub fn new_dev(block: Block<F>, fixed_table_tags: Vec<FixedTableTag>) -> Self {
+    pub fn new_dev(block: Block, fixed_table_tags: Vec<FixedTableTag>) -> Self {
         Self {
             block: Some(block),
             fixed_table_tags,
@@ -239,7 +258,7 @@ impl<F: Field> EvmCircuit<F> {
     }
 
     /// Calculate which rows are "actually" used in the circuit
-    pub fn get_active_rows(block: &Block<F>) -> (Vec<usize>, Vec<usize>) {
+    pub fn get_active_rows(block: &Block) -> (Vec<usize>, Vec<usize>) {
         let max_offset = Self::get_num_rows_required(block);
         // some gates are enabled on all rows
         let gates_row_ids = (0..max_offset).collect();
@@ -248,46 +267,38 @@ impl<F: Field> EvmCircuit<F> {
         (gates_row_ids, lookup_row_ids)
     }
 
-    pub fn get_num_rows_required_no_padding(block: &Block<F>) -> usize {
-        // Start at 1 so we can be sure there is an unused `next` row available
-        let mut num_rows = 1;
-        for transaction in &block.txs {
-            for step in &transaction.steps {
-                num_rows += step.execution_state.get_step_height();
-            }
-        }
-        num_rows += 1; // EndBlock
-        num_rows
-    }
-
-    pub fn get_num_rows_required(block: &Block<F>) -> usize {
+    pub fn get_num_rows_required(block: &Block) -> usize {
         let evm_rows = block.circuits_params.max_evm_rows;
         if evm_rows == 0 {
-            Self::get_min_num_rows_required(block)
+            Self::get_num_rows_required_no_padding(block)
         } else {
             // It must have at least one unused row.
             block.circuits_params.max_evm_rows + 1
         }
     }
 
-    pub fn get_min_num_rows_required(block: &Block<F>) -> usize {
+    pub fn get_num_rows_required_no_padding(block: &Block) -> usize {
         let mut num_rows = 0;
         for transaction in &block.txs {
             for step in &transaction.steps {
+                // EndInnerBlock included
                 num_rows += step.execution_state.get_step_height();
             }
         }
-
         // It must have one row for EndBlock and at least one unused one
-        num_rows + 2
+        num_rows += 1;
+        num_rows += ExecutionState::EndBlock.get_step_height();
+        num_rows += 1;
+        num_rows
+    }
+
+    pub fn get_test_cicuit_from_block(block: Block) -> Self {
+        let fixed_table_tags = detect_fixed_table_tags(&block);
+        EvmCircuit::<F>::new_dev(block, fixed_table_tags)
     }
 }
 
-// the diff is from the num of valid opcodes: self-destruct?
-#[cfg(not(feature = "scroll"))]
-const FIXED_TABLE_ROWS_NO_BITWISE: usize = 3647;
-#[cfg(feature = "scroll")]
-const FIXED_TABLE_ROWS_NO_BITWISE: usize = 3646;
+const FIXED_TABLE_ROWS_NO_BITWISE: usize = 3659;
 const FIXED_TABLE_ROWS: usize = FIXED_TABLE_ROWS_NO_BITWISE + 3 * 65536;
 
 impl<F: Field> SubCircuit<F> for EvmCircuit<F> {
@@ -299,12 +310,12 @@ impl<F: Field> SubCircuit<F> for EvmCircuit<F> {
         MAX_STEP_HEIGHT + STEP_STATE_HEIGHT + 3
     }
 
-    fn new_from_block(block: &witness::Block<F>) -> Self {
+    fn new_from_block(block: &witness::Block) -> Self {
         Self::new(block.clone())
     }
 
     /// Return the minimum number of rows required to prove the block
-    fn min_num_rows_block(block: &witness::Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &witness::Block) -> (usize, usize) {
         let num_rows_required_for_execution_steps: usize =
             Self::get_num_rows_required_no_padding(block);
         let mut total_rows = num_rows_required_for_execution_steps;
@@ -332,7 +343,6 @@ impl<F: Field> SubCircuit<F> for EvmCircuit<F> {
 
         config.load_fixed_table(layouter, self.fixed_table_tags.clone())?;
         config.load_byte_table(layouter)?;
-        config.pow_of_rand_table.assign(layouter, challenges)?;
         let export = config.execution.assign_block(layouter, block, challenges)?;
         self.exports.borrow_mut().replace(export);
         Ok(())
@@ -347,7 +357,7 @@ fn get_fixed_table_row_num(need_bitwise_lookup: bool) -> usize {
     }
 }
 
-fn need_bitwise_lookup<F: Field>(block: &Block<F>) -> bool {
+fn need_bitwise_lookup(block: &Block) -> bool {
     block.txs.iter().any(|tx| {
         tx.steps.iter().any(|step| {
             matches!(
@@ -361,7 +371,7 @@ fn need_bitwise_lookup<F: Field>(block: &Block<F>) -> bool {
     })
 }
 /// create fixed_table_tags needed given witness block
-pub(crate) fn detect_fixed_table_tags<F: Field>(block: &Block<F>) -> Vec<FixedTableTag> {
+pub(crate) fn detect_fixed_table_tags(block: &Block) -> Vec<FixedTableTag> {
     if need_bitwise_lookup(block) {
         FixedTableTag::iter().collect()
     } else {
@@ -378,26 +388,23 @@ pub(crate) fn detect_fixed_table_tags<F: Field>(block: &Block<F>) -> Vec<FixedTa
     }
 }
 
-#[cfg(all(feature = "disabled", test))]
 pub(crate) mod cached {
     use super::*;
     use halo2_proofs::halo2curves::bn256::Fr;
-    use lazy_static::lazy_static;
+    use std::sync::LazyLock;
 
     struct Cache {
         cs: ConstraintSystem<Fr>,
         config: (EvmCircuitConfig<Fr>, Challenges),
     }
 
-    lazy_static! {
-        /// Cached values of the ConstraintSystem after the EVM Circuit configuration and the EVM
-        /// Circuit configuration.  These values are calculated just once.
-        static ref CACHE: Cache = {
-            let mut meta = ConstraintSystem::<Fr>::default();
-            let config = EvmCircuit::<Fr>::configure(&mut meta);
-            Cache { cs: meta, config }
-        };
-    }
+    /// Cached values of the ConstraintSystem after the EVM Circuit configuration and the EVM
+    /// Circuit configuration.  These values are calculated just once.
+    static CACHE: LazyLock<Cache> = LazyLock::new(|| {
+        let mut meta = ConstraintSystem::<Fr>::default();
+        let config = EvmCircuit::<Fr>::configure(&mut meta);
+        Cache { cs: meta, config }
+    });
 
     /// Wrapper over the EvmCircuit that behaves the same way and also
     /// implements the halo2 Circuit trait, but reuses the precalculated
@@ -429,7 +436,7 @@ pub(crate) mod cached {
     }
 
     impl EvmCircuitCached {
-        pub fn get_test_cicuit_from_block(block: Block<Fr>) -> Self {
+        pub fn get_test_cicuit_from_block(block: Block) -> Self {
             Self(EvmCircuit::<Fr>::get_test_cicuit_from_block(block))
         }
     }
@@ -445,6 +452,8 @@ use crate::util::MockChallenges as Challenges;
 impl<F: Field> Circuit<F> for EvmCircuit<F> {
     type Config = (EvmCircuitConfig<F>, Challenges);
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self::default()
@@ -456,10 +465,13 @@ impl<F: Field> Circuit<F> for EvmCircuit<F> {
         let rw_table = RwTable::construct(meta);
         let tx_table = TxTable::construct(meta);
         let bytecode_table = BytecodeTable::construct(meta);
+        #[cfg(feature = "dual-bytecode")]
+        let bytecode_table1 = BytecodeTable::construct(meta);
         let block_table = BlockTable::construct(meta);
         let q_copy_table = meta.fixed_column();
         let copy_table = CopyTable::construct(meta, q_copy_table);
         let keccak_table = KeccakTable::construct(meta);
+        let sha256_table = SHA256Table::construct(meta);
         let exp_table = ExpTable::construct(meta);
         let sig_table = SigTable::construct(meta);
         let modexp_table = ModExpTable::construct(meta);
@@ -473,9 +485,12 @@ impl<F: Field> Circuit<F> for EvmCircuit<F> {
                     tx_table,
                     rw_table,
                     bytecode_table,
+                    #[cfg(feature = "dual-bytecode")]
+                    bytecode_table1,
                     block_table,
                     copy_table,
                     keccak_table,
+                    sha256_table,
                     exp_table,
                     sig_table,
                     modexp_table,
@@ -512,6 +527,23 @@ impl<F: Field> Circuit<F> for EvmCircuit<F> {
             block.circuits_params.max_rws,
             challenges.evm_word(),
         )?;
+
+        #[cfg(feature = "dual-bytecode")]
+        {
+            // when enable feature "dual-bytecode", get two sets of bytecodes here.
+            let (first_bytecodes, second_bytecodes) = block.get_bytecodes_for_dual_sub_circuits();
+            // assign first bytecode_table
+            config
+                .bytecode_table
+                .dev_load(&mut layouter, first_bytecodes, &challenges)?;
+
+            // assign second bytecode_table
+            config
+                .bytecode_table1
+                .dev_load(&mut layouter, second_bytecodes, &challenges)?;
+        }
+
+        #[cfg(not(feature = "dual-bytecode"))]
         config
             .bytecode_table
             .dev_load(&mut layouter, block.bytecodes.values(), &challenges)?;
@@ -524,6 +556,14 @@ impl<F: Field> Circuit<F> for EvmCircuit<F> {
         config
             .keccak_table
             .dev_load(&mut layouter, &block.sha3_inputs, &challenges)?;
+        config.sha256_table.dev_load(
+            &mut layouter,
+            block
+                .get_sha256()
+                .iter()
+                .map(|evt| (&evt.input, &evt.digest)),
+            &challenges,
+        )?;
         config.exp_table.dev_load(&mut layouter, block)?;
         config
             .sig_table
@@ -539,7 +579,9 @@ impl<F: Field> Circuit<F> for EvmCircuit<F> {
             &block.get_ec_pairing_ops(),
             &challenges,
         )?;
-
+        config
+            .pow_of_rand_table
+            .assign(&mut layouter, &challenges, 2048)?;
         self.synthesize_sub(&config, &challenges, &mut layouter)
     }
 }
@@ -782,7 +824,7 @@ mod evm_circuit_stats {
         builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
-        let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+        let block = block_convert(&builder.block, &builder.code_db).unwrap();
         let k = block.get_evm_test_circuit_degree();
 
         let circuit = EvmCircuit::<Fr>::get_test_cicuit_from_block(block);
@@ -804,7 +846,7 @@ mod evm_circuit_stats {
         builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
-        let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+        let block = block_convert(&builder.block, &builder.code_db).unwrap();
         let k = block.get_evm_test_circuit_degree();
         let circuit = EvmCircuit::<Fr>::get_test_cicuit_from_block(block);
         let prover2 = MockProver::<Fr>::run(k, &circuit, vec![]).unwrap();

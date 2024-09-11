@@ -1,5 +1,6 @@
+use crate::util::Field;
 use bus_mapping::evm::OpcodeId;
-use eth_types::{Field, ToLittleEndian, Word};
+use eth_types::{ToLittleEndian, Word};
 use halo2_proofs::circuit::Value;
 
 use crate::{evm_circuit::util::rlc, table::BytecodeFieldTag, util::Challenges};
@@ -124,5 +125,11 @@ impl Bytecode {
         };
 
         (byte, is_code, push_rlc)
+    }
+
+    /// The number of rows the `BytecodeCircuit` utilises to include the bytecode.
+    /// We use a single header row, plus a row per byte.
+    pub fn rows_required(&self) -> usize {
+        self.bytes.len() + 1
     }
 }

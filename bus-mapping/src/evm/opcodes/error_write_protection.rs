@@ -31,6 +31,7 @@ impl Opcode for ErrorWriteProtection {
         // assert op code can only be following codes
         assert!([
             OpcodeId::SSTORE,
+            OpcodeId::TSTORE,
             OpcodeId::CREATE,
             OpcodeId::CREATE2,
             OpcodeId::CALL,
@@ -44,14 +45,12 @@ impl Opcode for ErrorWriteProtection {
         .contains(&geth_step.op));
 
         if geth_step.op == OpcodeId::CALL {
-            // get only the frist three stack elements since the third one is the value we
+            // get only the first three stack elements since the third one is the value we
             // want to check.
-            for i in 0..3 {
-                state.stack_read(
-                    &mut exec_step,
-                    geth_step.stack.nth_last_filled(i),
-                    geth_step.stack.nth_last(i)?,
-                )?;
+            for _i in 0..3 {
+                let _v = state.stack_pop(&mut exec_step)?;
+                #[cfg(feature = "enable-stack")]
+                assert_eq!(_v, geth_step.stack.nth_last(_i)?);
             }
         }
 
@@ -63,7 +62,7 @@ impl Opcode for ErrorWriteProtection {
         )?;
 
         // `IsSuccess` call context operation is added in handle_return
-        state.handle_return(&mut [&mut exec_step], geth_steps, true)?;
+        state.handle_return((None, None), &mut [&mut exec_step], geth_steps, true)?;
         Ok(vec![exec_step])
     }
 }

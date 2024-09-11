@@ -1,7 +1,9 @@
-use crate::evm_circuit::util::{
-    constraint_builder::EVMConstraintBuilder, math_gadget::*, sum, CachedRegion,
+use crate::{
+    evm_circuit::util::{
+        constraint_builder::EVMConstraintBuilder, math_gadget::*, sum, CachedRegion,
+    },
+    util::Field,
 };
-use eth_types::Field;
 use halo2_proofs::plonk::{Error, Expression};
 
 /// Returns (lt, eq):
@@ -51,8 +53,12 @@ impl<F: Field, const N_BYTES: usize> ComparisonGadget<F, N_BYTES> {
 #[cfg(test)]
 mod tests {
     use super::{test_util::*, *};
-    use crate::evm_circuit::util::{constraint_builder::ConstrainBuilderCommon, Cell};
+    use crate::{
+        evm_circuit::util::{constraint_builder::ConstrainBuilderCommon, Cell},
+        util::Field,
+    };
     use eth_types::*;
+    use gadgets::ToScalar;
     use halo2_proofs::{halo2curves::bn256::Fr, plonk::Error};
 
     #[derive(Clone)]
@@ -107,7 +113,7 @@ mod tests {
         // a == b check
         try_test!(
             ComparisonTestContainer<Fr, 4, true>,
-            vec![Word::from(0), Word::from(0)],
+            [Word::from(0), Word::from(0)],
             true,
         );
     }
@@ -116,7 +122,7 @@ mod tests {
     fn test_comparison_1_eq() {
         try_test!(
             ComparisonTestContainer<Fr, 4, true>,
-            vec![Word::from(1), Word::from(1)],
+            [Word::from(1), Word::from(1)],
             true,
         );
     }
@@ -125,7 +131,7 @@ mod tests {
     fn test_comparison_max_eq() {
         try_test!(
             ComparisonTestContainer<Fr, 4, true>,
-            vec![Word::from(1 << 4), Word::from(1 << 4)],
+            [Word::from(1 << 4), Word::from(1 << 4)],
             true,
         );
     }
@@ -134,7 +140,7 @@ mod tests {
     fn test_comparison_0_neq_max() {
         try_test!(
             ComparisonTestContainer<Fr, 4, true>,
-            vec![Word::from(0), Word::from(1 << 4)],
+            [Word::from(0), Word::from(1 << 4)],
             false,
         );
     }
@@ -144,7 +150,7 @@ mod tests {
     fn test_comparison_0_lt_1() {
         try_test!(
             ComparisonTestContainer<Fr, 4, false>,
-            vec![Word::from(0), Word::from(1)],
+            [Word::from(0), Word::from(1)],
             true,
         );
     }
@@ -153,7 +159,7 @@ mod tests {
     fn test_comparison_1_lt_max() {
         try_test!(
             ComparisonTestContainer<Fr, 4, false>,
-            vec![Word::from(1), Word::from(1 << 4)],
+            [Word::from(1), Word::from(1 << 4)],
             true,
         );
     }
@@ -162,7 +168,7 @@ mod tests {
     fn test_comparison_1_lt_0() {
         try_test!(
             ComparisonTestContainer<Fr, 4, false>,
-            vec![Word::from(1), Word::from(0)],
+            [Word::from(1), Word::from(0)],
             false,
         );
     }
@@ -174,13 +180,13 @@ mod tests {
         let half_max_hi = U256([0, u64::MAX, 0, 0]);
         try_test!(
             ComparisonTestContainer<Fr, N_BYTES, false>,
-            vec![half_max_lo, half_max_hi],
+            [half_max_lo, half_max_hi],
             true,
         );
 
         try_test!(
             ComparisonTestContainer<Fr, N_BYTES, false>,
-            vec![half_max_hi, half_max_lo],
+            [half_max_hi, half_max_lo],
             false,
         );
     }
@@ -189,7 +195,7 @@ mod tests {
     fn test_comparison_overflow() {
         try_test!(
             ComparisonTestContainer<Fr, 4, false>,
-            vec![Word::from(10000), Word::from(1 << (4 + 1))],
+            [Word::from(10000), Word::from(1 << (4 + 1))],
             false,
         );
     }

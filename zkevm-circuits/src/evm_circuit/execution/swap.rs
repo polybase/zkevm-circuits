@@ -9,9 +9,9 @@ use crate::{
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{Expr, Field},
 };
-use eth_types::{evm_types::OpcodeId, Field};
+use eth_types::evm_types::OpcodeId;
 use halo2_proofs::plonk::Error;
 
 #[derive(Clone, Debug)]
@@ -62,12 +62,13 @@ impl<F: Field> ExecutionGadget<F> for SwapGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         for (cell, value) in self.phase2_values.iter().zip(
             [step.rw_indices[0], step.rw_indices[1]]

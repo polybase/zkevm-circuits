@@ -1,5 +1,7 @@
+#![allow(unused_mut)]
 use bus_mapping::{
-    circuit_input_builder::{keccak_inputs, BuilderClient, CircuitsParams, PrecompileEcParams},
+    circuit_input_builder::{BuilderClient, CircuitsParams, PrecompileEcParams},
+    util::read_env_var,
     Error::JSONRpcError,
 };
 use halo2_proofs::{
@@ -10,16 +12,18 @@ use halo2_proofs::{
 };
 use integration_tests::{get_client, log_init, CIRCUIT, END_BLOCK, START_BLOCK, TX_ID};
 use zkevm_circuits::{
+    bytecode_circuit::circuit::BytecodeCircuit,
     copy_circuit::CopyCircuit,
     evm_circuit::{witness::block_convert, EvmCircuit},
     keccak_circuit::keccak_packed_multi::multi_keccak,
+    mpt_circuit::MptCircuit,
     rlp_circuit_fsm::RlpCircuit,
     state_circuit::StateCircuit,
     super_circuit::SuperCircuit,
     tx_circuit::TestTxCircuit as TxCircuit,
     util::{Challenges, SubCircuit},
     witness,
-    witness::Transaction,
+    witness::{keccak::keccak_inputs, Transaction},
 };
 
 const CIRCUITS_PARAMS: CircuitsParams = CircuitsParams {
@@ -53,17 +57,18 @@ async fn test_mock_prove_tx() {
     }
     let cli = get_client();
     let params = CircuitsParams {
-        max_rws: 100000,
-        max_copy_rows: 100000,
+        max_rws: 2_000_000,
+        max_copy_rows: 2_000_000, // dynamic
         max_txs: 10,
-        max_calldata: 40000,
-        max_mpt_rows: 40000,
-        max_inner_blocks: 64,
-        max_bytecode: 40000,
-        max_keccak_rows: 0,
-        max_exp_steps: 5000,
+        max_calldata: 1_000_000,
+        max_inner_blocks: 8,
+        max_bytecode: 1_000_000,
+        max_mpt_rows: 200_000,
+        max_poseidon_rows: 2_000_000,
+        max_keccak_rows: 2_000_000,
+        max_exp_steps: 5_000,
         max_evm_rows: 0,
-        max_rlp_rows: 42000,
+        max_rlp_rows: 1_500_000,
         ..Default::default()
     };
 
@@ -75,7 +80,7 @@ async fn test_mock_prove_tx() {
         return;
     }
 
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     let errs = test_witness_block(&block);
     for err in &errs {
         log::error!("ERR: {}", err);
@@ -85,7 +90,7 @@ async fn test_mock_prove_tx() {
     log::info!("prove done");
 }
 
-fn test_with<C: SubCircuit<Fr> + Circuit<Fr>>(block: &witness::Block<Fr>) -> MockProver<Fr> {
+fn test_with<C: SubCircuit<Fr> + Circuit<Fr>>(block: &witness::Block) -> MockProver<Fr> {
     let num_row = C::min_num_rows_block(block).1;
     let k = zkevm_circuits::util::log2_ceil(num_row + 256);
     let k = k.max(22);
@@ -94,7 +99,7 @@ fn test_with<C: SubCircuit<Fr> + Circuit<Fr>>(block: &witness::Block<Fr>) -> Moc
     let circuit = C::new_from_block(block);
     MockProver::<Fr>::run(k, &circuit, circuit.instance()).unwrap()
 }
-fn test_witness_block(block: &witness::Block<Fr>) -> Vec<VerifyFailure> {
+fn test_witness_block(block: &witness::Block) -> Vec<VerifyFailure> {
     if *CIRCUIT == "none" {
         return Vec::new();
     }
@@ -108,6 +113,10 @@ fn test_witness_block(block: &witness::Block<Fr>) -> Vec<VerifyFailure> {
         test_with::<TxCircuit<Fr>>(block)
     } else if *CIRCUIT == "state" {
         test_with::<StateCircuit<Fr>>(block)
+    } else if *CIRCUIT == "mpt" {
+        test_with::<MptCircuit<Fr>>(block)
+    } else if *CIRCUIT == "bytecode" {
+        test_with::<BytecodeCircuit<Fr>>(block)
     } else if *CIRCUIT == "super" {
         test_with::<SuperCircuit<Fr, 350, 2_000_000, 64, 0x1000>>(block)
     } else {
@@ -127,14 +136,16 @@ async fn test_circuit_all_block() {
         let block_num = blk as u64;
         log::info!("test {} circuit, block number: {}", *CIRCUIT, block_num);
         let cli = get_client();
+        let max_txs = read_env_var("MAX_TXS", 128);
         let params = CircuitsParams {
             max_rws: 4_000_000,
             max_copy_rows: 0, // dynamic
-            max_txs: 350,
+            max_txs,
             max_calldata: 2_000_000,
             max_inner_blocks: 64,
             max_bytecode: 3_000_000,
             max_mpt_rows: 2_000_000,
+            max_poseidon_rows: 4_000_000,
             max_keccak_rows: 0,
             max_exp_steps: 100_000,
             max_evm_rows: 0,
@@ -145,6 +156,7 @@ async fn test_circuit_all_block() {
         let builder = cli.gen_inputs(block_num).await;
         if builder.is_err() {
             let err = builder.err().unwrap();
+            println!("{err:?}");
             let err_msg = match err {
                 JSONRpcError(_json_rpc_err) => "JSONRpcError".to_string(), // too long...
                 _ => format!("{err:?}"),
@@ -159,7 +171,7 @@ async fn test_circuit_all_block() {
             continue;
         }
 
-        let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+        let block = block_convert(&builder.block, &builder.code_db).unwrap();
         let errs = test_witness_block(&block);
         log::info!(
             "test {} circuit, block number: {} err num {:?}",
@@ -190,9 +202,8 @@ async fn test_print_circuits_size() {
             return;
         }
 
-        let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
-        let evm_rows = EvmCircuit::get_num_rows_required(&block);
-        let keccak_inputs = keccak_inputs(&builder.block, &builder.code_db).unwrap();
+        let block = block_convert(&builder.block, &builder.code_db).unwrap();
+        let evm_rows = EvmCircuit::<Fr>::get_num_rows_required(&block);
 
         let mock_randomness = Fr::from(0x100u64);
         let challenges = Challenges::mock(
@@ -200,6 +211,7 @@ async fn test_print_circuits_size() {
             Value::known(mock_randomness),
             Value::known(mock_randomness),
         );
+        let keccak_inputs = keccak_inputs(&block).unwrap();
         let keccak_rows = multi_keccak(&keccak_inputs, challenges, None)
             .unwrap()
             .len();
@@ -228,9 +240,8 @@ async fn test_circuit_batch() {
         log::info!("skip empty block");
         return;
     }
-
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
     log::info!("tx num: {}", builder.block.txs.len());
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     let errs = test_witness_block(&block);
     log::info!(
         "test {} circuit, block number: [{},{}], err num {:?}",

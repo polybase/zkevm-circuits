@@ -1,34 +1,87 @@
 #![allow(unused_imports)]
+use crate::witness::dummy_witness_block;
+
 pub use super::*;
 use bus_mapping::{
     circuit_input_builder::CircuitInputBuilder,
     evm::{OpcodeId, PrecompileCallArgs},
+    l2_predeployed,
     precompile::PrecompileCalls,
 };
 use ethers_signers::{LocalWallet, Signer};
-use halo2_proofs::{dev::MockProver, halo2curves::bn256::Fr};
+use halo2_proofs::{
+    dev::MockProver,
+    halo2curves::bn256::{Bn256, Fr},
+    plonk::keygen_vk,
+};
 use log::error;
 #[cfg(not(feature = "scroll"))]
 use mock::MOCK_DIFFICULTY;
 #[cfg(feature = "scroll")]
 use mock::MOCK_DIFFICULTY_L2GETH as MOCK_DIFFICULTY;
 use mock::{eth, TestContext, MOCK_CHAIN_ID};
+use params::ScrollSuperCircuit;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use std::env::set_var;
 
-use crate::witness::block_apply_mpt_state;
 #[cfg(feature = "scroll")]
 use eth_types::l2_types::BlockTrace;
 use eth_types::{address, bytecode, word, Bytecode, ToWord, Word};
 
 #[test]
+fn super_circuit_created_from_dummy_block() {
+    let dummy_block = Block {
+        circuits_params: CircuitsParams {
+            max_rws: 4_000_000,
+            max_copy_rows: 0, // dynamic
+            max_txs: 10,
+            max_calldata: 2_000_000,
+            max_inner_blocks: 8,
+            max_bytecode: 3_000_000,
+            max_mpt_rows: 2_000_000,
+            max_poseidon_rows: 4_000_000,
+            max_keccak_rows: 0,
+            max_exp_steps: 100_000,
+            max_evm_rows: 0,
+            max_rlp_rows: 2_070_000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let _circuit = SuperCircuit::<Fr, 128, 2_000_000, 64, 0x1000>::new_from_block(&dummy_block);
+}
+
+#[test]
 fn super_circuit_degree() {
     let mut cs = ConstraintSystem::<Fr>::default();
     SuperCircuit::<Fr, 1, 32, 64, 0x100>::configure(&mut cs);
+    cs = cs.chunk_lookups();
+
     log::info!("super circuit degree: {}", cs.degree());
     log::info!("super circuit minimum_rows: {}", cs.minimum_rows());
     assert!(cs.degree() <= 9);
+}
+
+// This circuit is used to prevent unexpected changes in circuit vk.
+// This test can run successfully now standalone `RUST_LOG=info cargo test --release --features=scroll super_circuit_vk -- --ignored`
+// but will fail in CI.  I don't understand, may due to env var like COINBASE/DIFFICULT/KECCAK_ROWS?
+// So have to ignore it now.
+#[ignore = "enable this when we want to prevent unexpected changes in circuit"]
+#[test]
+fn super_circuit_vk() {
+    use halo2_proofs::poly::kzg::commitment::ParamsKZG;
+    let params = ParamsKZG::<Bn256>::unsafe_setup_with_s(20, Fr::from(1234u64));
+    // chain_id is not related to vk, so we can use any value here.
+    let chain_id = 534351;
+    let circuit = ScrollSuperCircuit::new_from_block(&dummy_witness_block(chain_id));
+    let vk = keygen_vk(&params, &circuit).unwrap();
+    let protocol_hash = vk.transcript_repr();
+    log::info!("transcript_repr {:?}", protocol_hash);
+    assert_eq!(
+        "0x1b3d158be8148c9e8ac9fce6eff2c576027c356ee1ff68ad7662d61556d5a7d7",
+        format!("{:?}", protocol_hash)
+    );
 }
 
 #[cfg(feature = "scroll")]
@@ -47,19 +100,15 @@ fn test_super_circuit<
     MOCK_DIFFICULTY.to_big_endian(&mut difficulty_be_bytes);
     set_var("DIFFICULTY", hex::encode(difficulty_be_bytes));
 
-    let mut builder =
-        CircuitInputBuilder::new_from_l2_trace(circuits_params, l2_trace, false, false)
-            .expect("could not handle block tx");
+    let mut builder = CircuitInputBuilder::new_from_l2_trace(circuits_params, l2_trace, false)
+        .expect("could not handle block tx");
 
     builder
         .finalize_building()
         .expect("could not finalize building block");
 
     let mut block = block_convert(&builder.block, &builder.code_db).unwrap();
-    block_apply_mpt_state(
-        &mut block,
-        &builder.mpt_init_state.expect("used non-light mode"),
-    );
+    block.apply_mpt_updates(&builder.mpt_init_state.expect("used non-light mode"));
 
     let active_row_num =SuperCircuit::<
         Fr,
@@ -106,10 +155,15 @@ fn callee_bytecode(is_return: bool, offset: u64, length: u64) -> Bytecode {
 }
 
 #[cfg(feature = "scroll")]
+fn block_0tx_trace() -> BlockTrace {
+    block_0tx_ctx().l2_trace().clone()
+}
+
+#[cfg(feature = "scroll")]
 fn block_1tx_deploy() -> BlockTrace {
     let mut rng = ChaCha20Rng::seed_from_u64(2);
 
-    let chain_id = *MOCK_CHAIN_ID;
+    let chain_id = MOCK_CHAIN_ID;
 
     let wallet_a = LocalWallet::new(&mut rng).with_chain_id(chain_id);
     let addr_a = wallet_a.address();
@@ -130,10 +184,33 @@ fn block_1tx_deploy() -> BlockTrace {
     .clone()
 }
 
+fn block_0tx_ctx() -> TestContext<2, 0> {
+    let mut rng = ChaCha20Rng::seed_from_u64(2);
+
+    let chain_id = 222222u64;
+    let wallet_a = LocalWallet::new(&mut rng).with_chain_id(chain_id);
+
+    let addr_a = wallet_a.address();
+    let bytecode = l2_predeployed::l1_gas_price_oracle::V1_BYTECODE.clone();
+    TestContext::new(
+        Some(vec![Word::zero()]),
+        |accs| {
+            accs[0]
+                .address(*l2_predeployed::l1_gas_price_oracle::ADDRESS)
+                .balance(Word::from(1u64 << 20))
+                .code(bytecode);
+            accs[1].address(addr_a).balance(Word::from(1u64 << 20));
+        },
+        |mut _txs, _accs| {},
+        |block, _tx| block.number(0x5).chain_id(chain_id),
+    )
+    .unwrap()
+}
+
 fn block_1tx_ctx() -> TestContext<2, 1> {
     let mut rng = ChaCha20Rng::seed_from_u64(2);
 
-    let chain_id = *MOCK_CHAIN_ID;
+    let chain_id = MOCK_CHAIN_ID;
 
     let bytecode = bytecode! {
         GAS
@@ -177,7 +254,7 @@ pub(crate) fn block_1tx() -> GethData {
 fn block_2tx_ctx() -> TestContext<2, 2> {
     let mut rng = ChaCha20Rng::seed_from_u64(2);
 
-    let chain_id = *MOCK_CHAIN_ID;
+    let chain_id = MOCK_CHAIN_ID;
 
     let bytecode = bytecode! {
         GAS
@@ -226,6 +303,36 @@ const TEST_MOCK_RANDOMNESS: u64 = 0x100;
 
 // High memory usage test.  Run in serial with:
 // `cargo test [...] serial_ -- --ignored --test-threads 1`
+
+#[ignore]
+#[cfg(feature = "scroll")]
+#[test]
+fn serial_test_super_circuit_0tx_1max_tx() {
+    let block = block_0tx_trace();
+    const MAX_TXS: usize = 1;
+    const MAX_CALLDATA: usize = 256;
+    const MAX_INNER_BLOCKS: usize = 1;
+    let circuits_params = CircuitsParams {
+        max_txs: MAX_TXS,
+        max_calldata: MAX_CALLDATA,
+        max_rws: 256,
+        max_copy_rows: 256,
+        max_exp_steps: 256,
+        max_bytecode: 512,
+        max_mpt_rows: 2049,
+        max_poseidon_rows: 512,
+        max_evm_rows: 0,
+        max_keccak_rows: 0,
+        max_inner_blocks: MAX_INNER_BLOCKS,
+        max_rlp_rows: 500,
+        ..Default::default()
+    };
+    test_super_circuit::<MAX_TXS, MAX_CALLDATA, MAX_INNER_BLOCKS, TEST_MOCK_RANDOMNESS>(
+        block,
+        circuits_params,
+    );
+}
+
 #[ignore]
 #[cfg(feature = "scroll")]
 #[test]
@@ -448,4 +555,69 @@ fn serial_test_super_circuit_precompile_invalid_ec_pairing_fq_overflow() {
     let circuits_params = precomiple_super_circuits_params(MAX_TXS, MAX_CALLDATA);
 
     test_super_circuit::<MAX_TXS, MAX_CALLDATA, 1, TEST_MOCK_RANDOMNESS>(block, circuits_params);
+}
+
+#[ignore]
+#[cfg(feature = "scroll")]
+#[test]
+fn serial_test_super_circuit_precompile_sha256() {
+    const MAX_TXS: usize = 1;
+    const MAX_CALLDATA: usize = 0x180;
+
+    let block = precompile_block_trace::block_precompile_sha256();
+    let circuits_params = precomiple_super_circuits_params(MAX_TXS, MAX_CALLDATA);
+
+    test_super_circuit::<MAX_TXS, MAX_CALLDATA, 1, TEST_MOCK_RANDOMNESS>(block, circuits_params);
+}
+
+#[ignore]
+#[cfg(feature = "scroll")]
+#[test]
+fn serial_test_super_circuit_eip_1559_tx() {
+    const MAX_TXS: usize = 1;
+    const MAX_CALLDATA: usize = 256;
+
+    let block_trace = eip1559_2930::test_block_1559_trace();
+    let circuits_params = eip1559_2930::test_circuits_params(MAX_TXS, MAX_CALLDATA);
+
+    test_super_circuit::<MAX_TXS, MAX_CALLDATA, 1, TEST_MOCK_RANDOMNESS>(
+        block_trace,
+        circuits_params,
+    );
+}
+
+#[ignore]
+#[cfg(feature = "scroll")]
+#[test]
+fn serial_test_super_circuit_eip_2930_tx_no_accesslist() {
+    const MAX_TXS: usize = 2;
+    const MAX_CALLDATA: usize = 256;
+
+    // tx with no access list data
+    let block_trace = eip1559_2930::test_block_2930_trace(false);
+    let circuits_params = eip1559_2930::test_circuits_params(MAX_TXS, MAX_CALLDATA);
+
+    test_super_circuit::<MAX_TXS, MAX_CALLDATA, 1, TEST_MOCK_RANDOMNESS>(
+        block_trace,
+        circuits_params,
+    );
+}
+
+//TODO: disable this test for rlp issue now, will enable it after rlp issue fixed.
+// issue tracking here https://github.com/scroll-tech/zkevm-circuits/issues/1138
+#[ignore]
+#[cfg(feature = "scroll")]
+#[test]
+fn serial_test_super_circuit_eip_2930_tx_accesslist() {
+    const MAX_TXS: usize = 2;
+    const MAX_CALLDATA: usize = 256;
+
+    // tx with access list data
+    let block_trace = eip1559_2930::test_block_2930_trace(true);
+    let circuits_params = eip1559_2930::test_circuits_params(MAX_TXS, MAX_CALLDATA);
+
+    test_super_circuit::<MAX_TXS, MAX_CALLDATA, 1, TEST_MOCK_RANDOMNESS>(
+        block_trace,
+        circuits_params,
+    );
 }

@@ -3,6 +3,7 @@
 use crate::{
     copy_circuit::*,
     evm_circuit::{test::rand_bytes, witness::block_convert},
+    test_util::CircuitTestBuilder,
     util::unusable_rows,
     witness::Block,
 };
@@ -12,12 +13,18 @@ use bus_mapping::{
     mock::BlockData,
     precompile::PrecompileCalls,
 };
-use eth_types::{bytecode, geth_types::GethData, word, ToWord, Word};
+use eth_types::{
+    address, bytecode, geth_types::GethData, word, AccessList, AccessListItem, ToWord, Word, H256,
+};
+use ethers_signers::Signer;
 use halo2_proofs::{
     dev::{MockProver, VerifyFailure},
     halo2curves::bn256::Fr,
 };
-use mock::{test_ctx::helpers::account_0_code_account_1_no_code, TestContext, MOCK_ACCOUNTS};
+use mock::{
+    eth, gwei, test_ctx::helpers::account_0_code_account_1_no_code, MockTransaction, TestContext,
+    MOCK_ACCOUNTS, MOCK_WALLETS,
+};
 
 const K: u32 = 20;
 
@@ -30,23 +37,29 @@ fn copy_circuit_unusable_rows() {
 }
 
 /// Test copy circuit from copy events and test data
-pub fn test_copy_circuit<F: Field>(
+pub fn test_copy_circuit(
     copy_events: Vec<CopyEvent>,
     max_copy_rows: usize,
+    bytecode_map: Option<BTreeMap<Word, bool>>,
     external_data: ExternalData,
 ) -> Result<(), Vec<VerifyFailure>> {
-    let circuit =
-        CopyCircuit::<F>::new_with_external_data(copy_events, max_copy_rows, external_data);
+    let circuit = CopyCircuit::<Fr>::new_with_external_data(
+        copy_events,
+        max_copy_rows,
+        bytecode_map,
+        external_data,
+    );
 
-    let prover = MockProver::<F>::run(K, &circuit, vec![]).unwrap();
+    let prover = MockProver::<Fr>::run(K, &circuit, vec![]).unwrap();
     prover.verify_par()
 }
 
 /// Test copy circuit with the provided block witness
-pub fn test_copy_circuit_from_block<F: Field>(block: Block<F>) -> Result<(), Vec<VerifyFailure>> {
-    test_copy_circuit::<F>(
+pub fn test_copy_circuit_from_block(block: Block) -> Result<(), Vec<VerifyFailure>> {
+    test_copy_circuit(
         block.copy_events,
         block.circuits_params.max_copy_rows,
+        block.bytecode_map,
         ExternalData {
             max_txs: block.circuits_params.max_txs,
             max_calldata: block.circuits_params.max_calldata,
@@ -103,6 +116,26 @@ fn gen_codecopy_data() -> CircuitInputBuilder {
         PUSH32(Word::from(0x00))
         PUSH32(Word::from(0x00))
         CODECOPY
+        STOP
+    };
+    let test_ctx = TestContext::<2, 1>::simple_ctx_with_bytecode(code).unwrap();
+    let block: GethData = test_ctx.into();
+    let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+    builder
+        .handle_block(&block.eth_block, &block.geth_traces)
+        .unwrap();
+    builder
+}
+
+fn gen_mcopy_data() -> CircuitInputBuilder {
+    let code = bytecode! {
+        PUSH3(0x803f1au64) // value
+        PUSH1(0x40u64) // offset
+        MSTORE
+        PUSH32(Word::from(0x3a)) // copy_size
+        PUSH32(Word::from(0x40)) // src_offset
+        PUSH32(Word::from(0x00)) // dest_offset
+        MCOPY
         STOP
     };
     let test_ctx = TestContext::<2, 1>::simple_ctx_with_bytecode(code).unwrap();
@@ -259,6 +292,44 @@ fn gen_tx_log_data() -> CircuitInputBuilder {
     builder
 }
 
+fn gen_access_list_data() -> Block {
+    let test_access_list = AccessList(vec![
+        AccessListItem {
+            address: address!("0x0000000000000000000000000000000000001111"),
+            storage_keys: [10, 11].map(H256::from_low_u64_be).to_vec(),
+        },
+        AccessListItem {
+            address: address!("0x0000000000000000000000000000000000002222"),
+            storage_keys: [20, 22].map(H256::from_low_u64_be).to_vec(),
+        },
+        AccessListItem {
+            address: address!("0x0000000000000000000000000000000000003333"),
+            storage_keys: [30, 33].map(H256::from_low_u64_be).to_vec(),
+        },
+    ]);
+    let test_ctx = TestContext::<1, 1>::new(
+        None,
+        |accs| {
+            accs[0].address(MOCK_WALLETS[0].address()).balance(eth(20));
+        },
+        |mut txs, _accs| {
+            txs[0]
+                .from(MOCK_WALLETS[0].clone())
+                .to(MOCK_ACCOUNTS[0])
+                .gas_price(gwei(2))
+                .gas(Word::from(0x10000))
+                .value(eth(2))
+                .transaction_type(1) // Set tx type to EIP-2930.
+                .access_list(test_access_list);
+        },
+        |block, _tx| block.number(0xcafeu64),
+    )
+    .unwrap();
+    CircuitTestBuilder::new_from_test_ctx(test_ctx)
+        .build_witness_block()
+        .0
+}
+
 fn gen_create_data() -> CircuitInputBuilder {
     let code = bytecode! {
         PUSH21(Word::from("6B6020600060003760206000F3600052600C6014F3"))
@@ -304,56 +375,70 @@ fn gen_return_data() -> CircuitInputBuilder {
 #[test]
 fn copy_circuit_valid_calldatacopy() {
     let builder = gen_calldatacopy_data();
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     assert_eq!(test_copy_circuit_from_block(block), Ok(()));
 }
 
 #[test]
 fn copy_circuit_valid_codecopy() {
     let builder = gen_codecopy_data();
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
+    assert_eq!(test_copy_circuit_from_block(block), Ok(()));
+}
+
+// unit test for mcopy in copy circuit side.
+#[test]
+fn copy_circuit_valid_mcopy() {
+    let builder = gen_mcopy_data();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     assert_eq!(test_copy_circuit_from_block(block), Ok(()));
 }
 
 #[test]
 fn copy_circuit_valid_returndatacopy() {
     let builder = gen_returndatacopy_data();
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     assert_eq!(test_copy_circuit_from_block(block), Ok(()));
 }
 
 #[test]
 fn copy_circuit_valid_extcodecopy() {
     let builder = gen_extcodecopy_data();
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     assert_eq!(test_copy_circuit_from_block(block), Ok(()));
 }
 
 #[test]
 fn copy_circuit_valid_sha3() {
     let builder = gen_sha3_data();
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     assert_eq!(test_copy_circuit_from_block(block), Ok(()));
 }
 
 #[test]
 fn copy_circuit_valid_tx_log() {
     let builder = gen_tx_log_data();
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
+    assert_eq!(test_copy_circuit_from_block(block), Ok(()));
+}
+
+#[test]
+fn copy_circuit_valid_access_list() {
+    let block = gen_access_list_data();
     assert_eq!(test_copy_circuit_from_block(block), Ok(()));
 }
 
 #[test]
 fn copy_circuit_valid_create() {
     let builder = gen_create_data();
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     assert_eq!(test_copy_circuit_from_block(block), Ok(()));
 }
 
 #[test]
 fn copy_circuit_valid_return() {
     let builder = gen_return_data();
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     assert_eq!(test_copy_circuit_from_block(block), Ok(()));
 }
 
@@ -367,11 +452,11 @@ fn copy_circuit_invalid_calldatacopy() {
             .0
             .wrapping_add(1);
 
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
 
     assert_error_matches(
         test_copy_circuit_from_block(block),
-        vec!["Memory word lookup", "Tx calldata lookup"],
+        vec!["tx lookup for CallData", "rw lookup"],
     );
 }
 
@@ -385,11 +470,11 @@ fn copy_circuit_invalid_codecopy() {
             .0
             .wrapping_add(1);
 
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
 
     assert_error_matches(
         test_copy_circuit_from_block(block),
-        vec!["Memory word lookup", "Bytecode lookup"],
+        vec!["rw lookup", "Bytecode lookup"],
     );
 }
 
@@ -403,11 +488,11 @@ fn copy_circuit_invalid_extcodecopy() {
             .0
             .wrapping_add(1);
 
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
 
     assert_error_matches(
         test_copy_circuit_from_block(block),
-        vec!["Memory word lookup", "Bytecode lookup"],
+        vec!["rw lookup", "Bytecode lookup"],
     );
 }
 
@@ -421,12 +506,9 @@ fn copy_circuit_invalid_sha3() {
             .0
             .wrapping_add(1);
 
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
 
-    assert_error_matches(
-        test_copy_circuit_from_block(block),
-        vec!["Memory word lookup"],
-    );
+    assert_error_matches(test_copy_circuit_from_block(block), vec!["rw lookup"]);
 }
 
 #[test]
@@ -439,7 +521,7 @@ fn copy_circuit_invalid_tx_log() {
             .0
             .wrapping_add(1);
 
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     let result = test_copy_circuit_from_block(block);
 
     let errors = result.expect_err("result is not an error");
@@ -448,8 +530,6 @@ fn copy_circuit_invalid_tx_log() {
         .find(|err| matches!(err, VerifyFailure::Lookup { .. }))
         .expect("there should be a lookup error");
 }
-
-// todo: add invalid create/return/returndatacopy tests
 
 #[test]
 fn copy_circuit_precompile_call() {
@@ -481,14 +561,14 @@ fn copy_circuit_precompile_call() {
     builder
         .handle_block(&block.eth_block, &block.geth_traces)
         .unwrap();
-    let block = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block = block_convert(&builder.block, &builder.code_db).unwrap();
     assert_eq!(test_copy_circuit_from_block(block), Ok(()));
 }
 
 #[test]
 fn variadic_size_check() {
     let builder = gen_tx_log_data();
-    let block1 = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block1 = block_convert(&builder.block, &builder.code_db).unwrap();
 
     let block: GethData = TestContext::<0, 0>::new(None, |_| {}, |_, _| {}, |b, _| b)
         .unwrap()
@@ -499,14 +579,19 @@ fn variadic_size_check() {
     builder
         .handle_block(&block.eth_block, &block.geth_traces)
         .unwrap();
-    let block2 = block_convert::<Fr>(&builder.block, &builder.code_db).unwrap();
+    let block2 = block_convert(&builder.block, &builder.code_db).unwrap();
 
-    let circuit = CopyCircuit::<Fr>::new(block1.copy_events, block1.circuits_params.max_copy_rows);
+    let circuit = CopyCircuit::<Fr>::new(
+        block1.copy_events,
+        block1.circuits_params.max_copy_rows,
+        block1.bytecode_map,
+    );
     let prover1 = MockProver::<Fr>::run(14, &circuit, vec![]).unwrap();
 
     let circuit = CopyCircuit::<Fr>::new(
         block2.copy_events.clone(),
         block2.circuits_params.max_copy_rows,
+        block2.bytecode_map,
     );
     let prover2 = MockProver::<Fr>::run(14, &circuit, vec![]).unwrap();
 
@@ -528,6 +613,9 @@ fn assert_error_matches(result: Result<(), Vec<VerifyFailure>>, names: Vec<&str>
             VerifyFailure::CellNotAssigned { .. } => panic!(),
             VerifyFailure::ConstraintPoisoned { .. } => panic!(),
             VerifyFailure::Permutation { .. } => panic!(),
+            &VerifyFailure::InstanceCellNotAssigned { .. } | &VerifyFailure::Shuffle { .. } => {
+                todo!()
+            }
         }
     }
 }

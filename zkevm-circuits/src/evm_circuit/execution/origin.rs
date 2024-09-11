@@ -11,10 +11,10 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::{CallContextFieldTag, TxContextFieldTag},
-    util::Expr,
+    util::{Expr, Field},
 };
 use bus_mapping::evm::OpcodeId;
-use eth_types::{Field, ToLittleEndian};
+use eth_types::ToLittleEndian;
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 #[derive(Clone, Debug)]
@@ -67,14 +67,14 @@ impl<F: Field> ExecutionGadget<F> for OriginGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         tx: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
         let origin = block.rws[step.rw_indices[1]].stack_value();
 
-        // Assing TxId.
+        // Assign TxId.
         self.tx_id
             .assign(region, offset, Value::known(F::from(tx.id as u64)))?;
 
@@ -90,7 +90,8 @@ impl<F: Field> ExecutionGadget<F> for OriginGadget<F> {
         )?;
 
         // Assign SameContextGadget witnesses.
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
         Ok(())
     }
 }

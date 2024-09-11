@@ -13,9 +13,9 @@ use crate::{
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{Expr, Field},
 };
-use eth_types::{evm_types::OpcodeId, Field};
+use eth_types::evm_types::OpcodeId;
 use halo2_proofs::plonk::Error;
 
 #[derive(Clone, Debug)]
@@ -64,12 +64,13 @@ impl<F: Field> ExecutionGadget<F> for GasGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        _block: &Block<F>,
+        block: &Block,
         _transaction: &Transaction,
-        _call: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         // The GAS opcode takes into account the reduction of gas available due
         // to the instruction itself.

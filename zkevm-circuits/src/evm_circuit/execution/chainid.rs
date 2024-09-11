@@ -10,10 +10,9 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::BlockContextFieldTag,
-    util::Expr,
+    util::{Expr, Field},
 };
 use bus_mapping::evm::OpcodeId;
-use eth_types::Field;
 use halo2_proofs::plonk::Error;
 
 #[derive(Clone, Debug)]
@@ -61,12 +60,13 @@ impl<F: Field> ExecutionGadget<F> for ChainIdGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         let chain_id = block.rws[step.rw_indices[0]].stack_value().as_u64();
         self.chain_id

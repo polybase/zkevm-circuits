@@ -13,11 +13,11 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::CallContextFieldTag,
-    util::Expr,
+    util::{Expr, Field},
 };
 use eth_types::{
     evm_types::{GasCost, OpcodeId},
-    Field, ToLittleEndian,
+    ToLittleEndian,
 };
 use halo2_proofs::{circuit::Value, plonk::Error};
 
@@ -89,7 +89,7 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGAccountAccessGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         tx: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -139,12 +139,11 @@ mod test {
         Address, Bytecode, ToWord, Word, U256,
     };
     use itertools::Itertools;
-    use lazy_static::lazy_static;
     use mock::TestContext;
+    use std::sync::LazyLock;
 
-    lazy_static! {
-        static ref TEST_ADDRESS: Address = address!("0xaabbccddee000000000000000000000000000000");
-    }
+    static TEST_ADDRESS: LazyLock<Address> =
+        LazyLock::new(|| address!("0xaabbccddee000000000000000000000000000000"));
 
     #[test]
     fn oog_account_access_root() {

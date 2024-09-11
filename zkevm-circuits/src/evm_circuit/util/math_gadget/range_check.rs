@@ -1,11 +1,13 @@
-use crate::evm_circuit::{
-    param::MAX_N_BYTES_INTEGER,
-    util::{
-        constraint_builder::{ConstrainBuilderCommon, EVMConstraintBuilder},
-        from_bytes, CachedRegion, Cell,
+use crate::{
+    evm_circuit::{
+        param::MAX_N_BYTES_INTEGER,
+        util::{
+            constraint_builder::{ConstrainBuilderCommon, EVMConstraintBuilder},
+            from_bytes, CachedRegion, Cell,
+        },
     },
+    util::Field,
 };
-use eth_types::Field;
 use halo2_proofs::{
     circuit::Value,
     plonk::{Error, Expression},
@@ -51,8 +53,10 @@ impl<F: Field, const N_BYTES: usize> RangeCheckGadget<F, N_BYTES> {
 #[cfg(test)]
 mod tests {
     use super::{super::test_util::*, *};
+    use crate::util::Field;
     use eth_types::*;
     use gadgets::util::Expr;
+    use gadgets::ToScalar;
     use halo2_proofs::{circuit::Value, halo2curves::bn256::Fr, plonk::Error};
 
     #[derive(Clone)]
@@ -91,13 +95,13 @@ mod tests {
 
     #[test]
     fn test_rangecheck_just_in_range() {
-        try_test!(RangeCheckTestContainer<Fr, 4>, vec![Word::from(0)], true);
+        try_test!(RangeCheckTestContainer<Fr, 4>, [Word::from(0)], true);
 
-        try_test!(RangeCheckTestContainer<Fr, 4>, vec![Word::from(1)], true);
+        try_test!(RangeCheckTestContainer<Fr, 4>, [Word::from(1)], true);
         // max - 1
         try_test!(
             RangeCheckTestContainer<Fr, 4>,
-            vec![Word::from((1u64 << 32) - 1)],
+            [Word::from((1u64 << 32) - 1)],
             true,
         );
     }
@@ -106,7 +110,7 @@ mod tests {
     fn test_rangecheck_out_of_range() {
         try_test!(
             RangeCheckTestContainer<Fr, 4>,
-            vec![Word::from(1u64 << 32)],
+            [Word::from(1u64 << 32)],
             false,
         );
     }

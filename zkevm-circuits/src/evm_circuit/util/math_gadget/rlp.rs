@@ -1,5 +1,7 @@
-use eth_types::{Address, Field, ToLittleEndian, ToScalar, Word};
+use crate::util::Field;
+use eth_types::{Address, ToLittleEndian, Word};
 use gadgets::util::{and, expr_from_bytes, not, select, sum, Expr};
+use gadgets::ToScalar;
 use halo2_proofs::{
     circuit::Value,
     plonk::{Error, Expression},
@@ -422,8 +424,8 @@ impl<F: Field, const IS_CREATE2: bool> ContractCreateGadget<F, IS_CREATE2> {
 #[cfg(test)]
 mod test {
     use super::{super::test_util::*, ContractCreateGadget};
-    use bus_mapping::state_db::CodeDB;
-    use eth_types::{Field, ToAddress, ToLittleEndian, ToWord, Word};
+    use crate::util::Field;
+    use eth_types::{state_db::CodeDB, ToAddress, ToLittleEndian, ToWord, Word};
     use ethers_core::utils::keccak256;
     use gadgets::util::{not, Expr};
     use halo2_proofs::halo2curves::bn256::Fr;
@@ -578,7 +580,7 @@ mod test {
             };
             try_test!(
                 ContractCreateGadgetContainer<Fr, false>,
-                vec![
+                [
                     caller_address.to_word(),
                     Word::from(caller_nonce),
                     rlp_len,
@@ -593,12 +595,12 @@ mod test {
     fn create2_address() {
         let caller_address = mock::MOCK_ACCOUNTS[0];
         let salt = Word::from(0xbeefcafedeadu64);
-        let code = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let code = [1, 2, 3, 4, 5, 6, 7, 8];
         let code_hash = Word::from(CodeDB::hash(&code).to_fixed_bytes());
-        let keccak_code_hash = Word::from(keccak256(&code));
+        let keccak_code_hash = Word::from(keccak256(code));
         try_test!(
             ContractCreateGadgetContainer<Fr, true>,
-            vec![
+            [
                 caller_address.to_word(),
                 Word::default(),
                 85u64.into(),

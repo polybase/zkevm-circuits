@@ -16,12 +16,13 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::CallContextFieldTag,
-    util::Expr,
+    util::{Expr, Field},
 };
 use eth_types::{
     evm_types::{GasCost, OpcodeId},
-    Field, ToScalar, U256,
+    U256,
 };
+use gadgets::ToScalar;
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 /// Gadget to implement the corresponding out of gas errors for
@@ -154,7 +155,7 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGSloadSstoreGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         tx: &Transaction,
         call: &Call,
         step: &ExecStep,
@@ -401,8 +402,8 @@ mod test {
             }
 
             Self {
-                bytecode,
                 gas_cost,
+                bytecode,
                 ..Default::default()
             }
         }

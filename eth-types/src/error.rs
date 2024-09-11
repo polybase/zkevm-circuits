@@ -8,6 +8,8 @@ use std::error::Error as StdError;
 pub enum Error {
     /// Serde de/serialization error.
     SerdeError(serde_json::error::Error),
+    /// hex parsing error
+    HexError(hex::FromHexError),
     /// Error while generating a trace.
     TracingError(String),
     /// Block is missing information about number or base_fee
@@ -28,17 +30,13 @@ pub enum Error {
     InvalidMemoryPointer,
     /// Error while trying to access an invalid/empty Storage key.
     InvalidStorageKey,
+    /// Error while trying to access an invalid/empty Transient Storage key.
+    InvalidTransientStorageKey,
     /// Error when an EvmWord is too big to be converted into a
     /// `MemoryAddress`.
     WordToMemAddr,
     /// Signature parsing error.
-    Signature(libsecp256k1::Error),
-}
-
-impl From<libsecp256k1::Error> for Error {
-    fn from(err: libsecp256k1::Error) -> Self {
-        Error::Signature(err)
-    }
+    Signature,
 }
 
 impl Display for Error {

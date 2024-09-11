@@ -51,7 +51,7 @@ impl Default for MockBlock {
             state_root: Hash::zero(),
             transactions_root: Hash::zero(),
             receipts_root: Hash::zero(),
-            number: U64([0u64]),
+            number: U64([1u64]),
             gas_used: Word::zero(),
             gas_limit: *MOCK_GASLIMIT,
             base_fee_per_gas: *MOCK_BASEFEE,
@@ -66,7 +66,7 @@ impl Default for MockBlock {
             size: Word::zero(),
             mix_hash: Hash::zero(),
             nonce: H64::zero(),
-            chain_id: *MOCK_CHAIN_ID,
+            chain_id: MOCK_CHAIN_ID,
         }
     }
 }
@@ -95,6 +95,21 @@ impl From<MockBlock> for Block<Transaction> {
                 .transactions
                 .iter_mut()
                 .map(|mock_tx| {
+                    // adjust gas price for eip1559 type tx.
+                    let gas_price = if mock_tx.transaction_type == U64::from(2) {
+                        let base_fee = mock.base_fee_per_gas;
+                        let priority_fee_per_gas = std::cmp::min(
+                            mock_tx.max_priority_fee_per_gas,
+                            mock_tx.max_fee_per_gas - base_fee,
+                        );
+                        let effective_gas_price = priority_fee_per_gas + base_fee;
+                        Some(effective_gas_price)
+                    } else {
+                        mock_tx.gas_price
+                    };
+
+                    mock_tx.gas_price = gas_price;
+
                     (mock_tx
                         .chain_id(mock.chain_id)
                         .block_number(mock.number.as_u64())

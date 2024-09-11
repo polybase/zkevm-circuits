@@ -12,7 +12,7 @@ mod dev;
 mod test;
 #[cfg(any(feature = "test", test, feature = "test-circuits"))]
 pub use dev::StateCircuit as TestStateCircuit;
-use mpt_zktrie::mpt_circuits::MPTProofType;
+use mpt_circuits::MPTProofType;
 
 use self::{
     constraint_builder::{MptUpdateTableQueries, RwTableQueries},
@@ -21,11 +21,11 @@ use self::{
 use crate::{
     evm_circuit::{param::N_BYTES_WORD, util::rlc},
     table::{AccountFieldTag, LookupTable, MptTable, RwTable, RwTableTag},
-    util::{Challenges, Expr, SubCircuit, SubCircuitConfig},
+    util::{Challenges, Expr, Field, SubCircuit, SubCircuitConfig},
     witness::{self, MptUpdates, Rw, RwMap},
 };
 use constraint_builder::{ConstraintBuilder, Queries};
-use eth_types::{Address, Field, ToLittleEndian};
+use eth_types::{Address, ToLittleEndian, ToWord};
 use gadgets::{
     batched_is_zero::{BatchedIsZeroChip, BatchedIsZeroConfig},
     binary_number::{BinaryNumberChip, BinaryNumberConfig},
@@ -243,8 +243,8 @@ impl<F: Field> StateCircuitConfig<F> {
         );
         let rows_len = rows.len();
 
-        let mut state_root =
-            randomness.map(|randomness| rlc::value(&updates.old_root().to_le_bytes(), randomness));
+        let mut state_root = randomness
+            .map(|randomness| rlc::value(&updates.old_root().to_word().to_le_bytes(), randomness));
 
         let mut start_state_root: Option<AssignedCell<_, F>> = None;
         let mut end_state_root: Option<AssignedCell<_, F>> = None;
@@ -570,8 +570,8 @@ impl<F: Field> StateCircuitConfig<F> {
     ) -> Result<StateCircuitExports<Assigned<F>>, Error> {
         let rows_len = rows.len();
 
-        let mut state_root =
-            randomness.map(|randomness| rlc::value(&updates.old_root().to_le_bytes(), randomness));
+        let mut state_root = randomness
+            .map(|randomness| rlc::value(&updates.old_root().to_word().to_le_bytes(), randomness));
 
         let mut start_state_root: Option<AssignedCell<_, F>> = None;
         let mut end_state_root: Option<AssignedCell<_, F>> = None;
@@ -738,7 +738,6 @@ impl<F: Field> StateCircuitConfig<F> {
                 .enumerate()
                 .map(|(part_idx, (indices, is_first_time))| {
                     let rows = rows.as_slice();
-                    let updates = updates;
                     move |mut region: Region<'_, F>| {
                         if *is_first_time {
                             *is_first_time = false;
@@ -879,11 +878,7 @@ impl<F: Field> StateCircuit<F> {
     pub fn new(rw_map: RwMap, n_rows: usize) -> Self {
         let rows = rw_map.table_assignments();
         log::warn!("build StateCircuit from mock MptUpdates");
-        let updates = MptUpdates::from_rws_with_mock_state_roots(
-            &rows,
-            0xcafeu64.into(),
-            0xdeadbeefu64.into(),
-        );
+        let updates = MptUpdates::mock_from(&rows);
         Self {
             rows,
             updates,
@@ -891,7 +886,7 @@ impl<F: Field> StateCircuit<F> {
             n_rows,
             #[cfg(any(feature = "test", test, feature = "test-circuits"))]
             overrides: HashMap::new(),
-            _marker: PhantomData::default(),
+            _marker: PhantomData,
         }
     }
 }
@@ -899,7 +894,7 @@ impl<F: Field> StateCircuit<F> {
 impl<F: Field> SubCircuit<F> for StateCircuit<F> {
     type Config = StateCircuitConfig<F>;
 
-    fn new_from_block(block: &witness::Block<F>) -> Self {
+    fn new_from_block(block: &witness::Block) -> Self {
         let rows = block.rws.table_assignments();
         let updates = block.mpt_updates.clone();
         Self {
@@ -909,7 +904,7 @@ impl<F: Field> SubCircuit<F> for StateCircuit<F> {
             n_rows: block.circuits_params.max_rws,
             #[cfg(any(feature = "test", test, feature = "test-circuits"))]
             overrides: HashMap::new(),
-            _marker: PhantomData::default(),
+            _marker: PhantomData,
         }
     }
 
@@ -920,7 +915,7 @@ impl<F: Field> SubCircuit<F> for StateCircuit<F> {
     }
 
     /// Return the minimum number of rows required to prove the block
-    fn min_num_rows_block(block: &witness::Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &witness::Block) -> (usize, usize) {
         let total_rw_count = block.rws.0.values().flatten().count() + 1;
         (
             total_rw_count,

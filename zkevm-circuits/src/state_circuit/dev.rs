@@ -3,9 +3,8 @@ pub use super::StateCircuit;
 use crate::{
     state_circuit::{StateCircuitConfig, StateCircuitConfigArgs},
     table::{MptTable, RwTable},
-    util::{Challenges, SubCircuit, SubCircuitConfig},
+    util::{Challenges, Field, SubCircuit, SubCircuitConfig},
 };
-use eth_types::Field;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner},
     plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
@@ -17,6 +16,8 @@ where
 {
     type Config = (StateCircuitConfig<F>, Challenges);
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self::default()
@@ -87,6 +88,8 @@ pub enum AdviceColumn {
     // NonEmptyWitness is the BatchedIsZero chip witness that contains the
     // inverse of the non-zero value if any in [committed_value, value]
     NonEmptyWitness,
+    StateRoot,
+    FieldTag,
 }
 
 impl AdviceColumn {
@@ -117,6 +120,8 @@ impl AdviceColumn {
             Self::InitialValue => config.initial_value,
             Self::IsZero => config.is_non_exist.is_zero,
             Self::NonEmptyWitness => config.is_non_exist.nonempty_witness,
+            Self::StateRoot => config.state_root,
+            Self::FieldTag => config.rw_table.field_tag,
         }
     }
 }

@@ -9,14 +9,12 @@ use crate::{
         AccountFieldTag, BytecodeFieldTag, CallContextFieldTag, RwTableTag, TxContextFieldTag,
         TxLogFieldTag, TxReceiptFieldTag,
     },
-    util::{build_tx_log_expression, Challenges, Expr},
+    util::{build_tx_log_expression, Challenges, Expr, Field},
 };
-use bus_mapping::{
-    state_db::EMPTY_CODE_HASH_LE,
-    util::{KECCAK_CODE_HASH_EMPTY, POSEIDON_CODE_HASH_EMPTY},
-};
-use eth_types::{Field, ToLittleEndian, ToScalar, ToWord};
-use gadgets::util::{and, not, sum};
+use bus_mapping::util::{KECCAK_CODE_HASH_EMPTY, POSEIDON_CODE_HASH_EMPTY};
+use eth_types::{state_db::EMPTY_CODE_HASH_LE, ToLittleEndian, ToWord, H256};
+use gadgets::util::{and, not};
+use gadgets::ToScalar;
 use halo2_proofs::{
     circuit::Value,
     plonk::{
@@ -174,7 +172,7 @@ impl<F: Field> ReversionInfo<F> {
     }
 }
 
-pub(crate) trait ConstrainBuilderCommon<F: Field> {
+pub trait ConstrainBuilderCommon<F: Field> {
     fn add_constraint(&mut self, name: &'static str, constraint: Expression<F>);
 
     fn require_zero(&mut self, name: &'static str, constraint: Expression<F>) {
@@ -236,7 +234,7 @@ impl<F: Field> BaseConstraintBuilder<F> {
         }
     }
 
-    pub(crate) fn condition<R>(
+    pub fn condition<R>(
         &mut self,
         condition: Expression<F>,
         constraint: impl FnOnce(&mut Self) -> R,
@@ -263,7 +261,7 @@ impl<F: Field> BaseConstraintBuilder<F> {
         }
     }
 
-    pub(crate) fn gate(&self, selector: Expression<F>) -> Vec<(&'static str, Expression<F>)> {
+    pub fn gate(&self, selector: Expression<F>) -> Vec<(&'static str, Expression<F>)> {
         self.constraints
             .clone()
             .into_iter()
@@ -305,7 +303,6 @@ pub(crate) struct EVMConstraintBuilder<'a, F> {
     execution_state: ExecutionState,
     constraints: Constraints<F>,
     rw_counter_offset: Expression<F>,
-    program_counter_offset: usize,
     stack_pointer_offset: Expression<F>,
     log_id_offset: usize,
     in_next_step: bool,
@@ -333,8 +330,6 @@ impl<'a, F: Field> ConstrainBuilderCommon<F> for EVMConstraintBuilder<'a, F> {
     }
 }
 
-pub(crate) type BoxedClosure<'a, F> = Box<dyn FnOnce(&mut EVMConstraintBuilder<F>) + 'a>;
-
 impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
     pub(crate) fn new(
         curr: Step<F>,
@@ -355,7 +350,6 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
                 not_step_last: Vec::new(),
             },
             rw_counter_offset: 0.expr(),
-            program_counter_offset: 0,
             stack_pointer_offset: 0.expr(),
             log_id_offset: 0,
             in_next_step: false,
@@ -408,8 +402,10 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         self.rw_counter_offset.clone()
     }
 
-    pub(crate) fn program_counter_offset(&self) -> usize {
-        self.program_counter_offset
+    // Warn: this is a debug helper,only used in debug purpose: if we want to diagnose which `copy_table_lookup` failed, can comment that
+    // `copy_table_lookup` codes, and call this method to increase rw_counter correctly, thus make other constraints succeed.
+    pub(crate) fn add_counter_offset(&mut self, offset: Expression<F>) {
+        self.rw_counter_offset = self.rw_counter_offset.clone() + self.condition_expr() * offset;
     }
 
     pub(crate) fn stack_pointer_offset(&self) -> Expression<F> {
@@ -497,6 +493,29 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         .query_cells(cell_type, count)
     }
 
+    pub(crate) fn code_hash(&self, codehash: H256) -> Expression<F> {
+        let bytes = codehash.to_word().to_le_bytes();
+        if cfg!(feature = "poseidon-codehash") {
+            // Recover the poseidon hash fr
+            rlc::expr(
+                &bytes.map(|b| b.expr()),
+                Expression::Constant(F::from(256u64)),
+            )
+        } else {
+            self.word_rlc(bytes.map(|b| b.expr()))
+        }
+    }
+
+    pub(crate) fn keccak_code_hash(&self, codehash: H256) -> Expression<F> {
+        let bytes = codehash.to_word().to_le_bytes();
+        self.word_rlc(bytes.map(|b| b.expr()))
+    }
+
+    pub(crate) fn word_rlc_constant(&self, word: eth_types::Word) -> Expression<F> {
+        let bytes = word.to_le_bytes();
+        self.word_rlc(bytes.map(|b| b.expr()))
+    }
+
     pub(crate) fn word_rlc<const N: usize>(&self, bytes: [Expression<F>; N]) -> Expression<F> {
         rlc::expr(&bytes, self.challenges.evm_word())
     }
@@ -574,6 +593,7 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         constrain!(memory_word_size);
         constrain!(reversible_write_counter);
         constrain!(log_id);
+        constrain!(end_tx);
     }
 
     // Fixed
@@ -629,32 +649,58 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         );
     }
 
-    // Opcode
+    // lookup real opcode. opcode_lookup_rlc ensures is_code = 1
+    pub(crate) fn lookup_opcode(
+        &mut self,
+        opcode: Expression<F>,
+        is_first_bytecode_table: Expression<F>,
+    ) {
+        self.lookup_opcode_with_push_rlc(opcode, 0.expr(), is_first_bytecode_table);
+    }
 
-    pub(crate) fn opcode_lookup(&mut self, opcode: Expression<F>, is_code: Expression<F>) {
-        assert_eq!(is_code, 1.expr());
-        self.opcode_lookup_rlc(opcode, 0.expr());
+    pub(crate) fn lookup_opcode_with_push_rlc(
+        &mut self,
+        opcode: Expression<F>,
+        push_rlc: Expression<F>,
+        is_first_bytecode_table: Expression<F>,
+    ) {
+        self.condition(is_first_bytecode_table.expr(), |cb| {
+            cb.opcode_lookup_rlc(opcode.expr(), push_rlc.expr());
+        });
+
+        #[cfg(feature = "dual-bytecode")]
+        self.condition(not::expr(is_first_bytecode_table.expr()), |cb| {
+            cb.opcode_lookup_rlc2(opcode.expr(), push_rlc);
+        });
     }
 
     pub(crate) fn opcode_lookup_at(
         &mut self,
         index: Expression<F>,
         opcode: Expression<F>,
-        is_code: Expression<F>,
+        is_first_bytecode_table: Expression<F>,
     ) {
-        assert_eq!(is_code, 1.expr());
-        self.opcode_lookup_at_rlc(index, opcode, 0.expr());
+        self.condition(is_first_bytecode_table.clone(), |cb| {
+            cb.opcode_lookup_at_rlc(index.clone(), opcode.clone(), 0.expr());
+        });
+
+        #[cfg(feature = "dual-bytecode")]
+        self.condition(not::expr(is_first_bytecode_table), |cb| {
+            cb.opcode_lookup_at_rlc1(index, opcode, 0.expr());
+        });
     }
 
     pub(crate) fn opcode_lookup_rlc(&mut self, opcode: Expression<F>, push_rlc: Expression<F>) {
-        self.opcode_lookup_at_rlc(
-            self.curr.state.program_counter.expr() + self.program_counter_offset.expr(),
-            opcode,
-            push_rlc,
-        );
-        self.program_counter_offset += 1;
+        self.opcode_lookup_at_rlc(self.curr.state.program_counter.expr(), opcode, push_rlc);
     }
 
+    #[cfg(feature = "dual-bytecode")]
+    // helper to lookup second bytecode table.
+    pub(crate) fn opcode_lookup_rlc2(&mut self, opcode: Expression<F>, push_rlc: Expression<F>) {
+        self.opcode_lookup_at_rlc1(self.curr.state.program_counter.expr(), opcode, push_rlc);
+    }
+
+    // lookup bytecode_table.
     pub(crate) fn opcode_lookup_at_rlc(
         &mut self,
         index: Expression<F>,
@@ -665,6 +711,29 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         self.add_lookup(
             "Opcode lookup",
             Lookup::Bytecode {
+                hash: self.curr.state.code_hash.expr(),
+                tag: BytecodeFieldTag::Byte.expr(),
+                index,
+                is_code: 1.expr(),
+                value: opcode,
+                push_rlc,
+            }
+            .conditional(1.expr() - is_root_create),
+        );
+    }
+
+    #[cfg(feature = "dual-bytecode")]
+    // lookup bytecode_table1.
+    pub(crate) fn opcode_lookup_at_rlc1(
+        &mut self,
+        index: Expression<F>,
+        opcode: Expression<F>,
+        push_rlc: Expression<F>,
+    ) {
+        let is_root_create = self.curr.state.is_root.expr() * self.curr.state.is_create.expr();
+        self.add_lookup(
+            "Opcode lookup from Bytecode1",
+            Lookup::Bytecode1 {
                 hash: self.curr.state.code_hash.expr(),
                 tag: BytecodeFieldTag::Byte.expr(),
                 index,
@@ -699,10 +768,47 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         )
     }
 
+    #[cfg(feature = "dual-bytecode")]
+    pub(crate) fn bytecode_lookup1(
+        &mut self,
+        code_hash: Expression<F>,
+        index: Expression<F>,
+        is_code: Expression<F>,
+        value: Expression<F>,
+        push_rlc: Expression<F>,
+    ) {
+        self.add_lookup(
+            "Bytecode1 (byte) lookup",
+            Lookup::Bytecode1 {
+                hash: code_hash,
+                tag: BytecodeFieldTag::Byte.expr(),
+                index,
+                is_code,
+                value,
+                push_rlc,
+            },
+        )
+    }
+
     pub(crate) fn bytecode_length(&mut self, code_hash: Expression<F>, value: Expression<F>) {
         self.add_lookup(
             "Bytecode (length)",
             Lookup::Bytecode {
+                hash: code_hash,
+                tag: BytecodeFieldTag::Header.expr(),
+                index: 0.expr(),
+                is_code: 0.expr(),
+                value,
+                push_rlc: 0.expr(),
+            },
+        );
+    }
+
+    #[cfg(feature = "dual-bytecode")]
+    pub(crate) fn bytecode1_length(&mut self, code_hash: Expression<F>, value: Expression<F>) {
+        self.add_lookup(
+            "Bytecode1 (length)",
+            Lookup::Bytecode1 {
                 hash: code_hash,
                 tag: BytecodeFieldTag::Header.expr(),
                 index: 0.expr(),
@@ -1110,6 +1216,58 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         );
     }
 
+    // Account Transient Storage
+    pub(crate) fn account_transient_storage_read(
+        &mut self,
+        account_address: Expression<F>,
+        key: Expression<F>,
+        value: Expression<F>,
+        tx_id: Expression<F>,
+    ) {
+        self.rw_lookup(
+            "account_transient_storage_read",
+            false.expr(),
+            RwTableTag::AccountTransientStorage,
+            RwValues::new(
+                tx_id,
+                account_address,
+                0.expr(),
+                key,
+                value.clone(),
+                value,
+                0.expr(),
+                0.expr(),
+            ),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn account_transient_storage_write(
+        &mut self,
+        account_address: Expression<F>,
+        key: Expression<F>,
+        value: Expression<F>,
+        value_prev: Expression<F>,
+        tx_id: Expression<F>,
+        reversion_info: Option<&mut ReversionInfo<F>>,
+    ) {
+        self.reversible_write(
+            "account_transient_storage_write",
+            RwTableTag::AccountTransientStorage,
+            RwValues::new(
+                tx_id,
+                account_address,
+                0.expr(),
+                key,
+                value,
+                value_prev,
+                0.expr(),
+                0.expr(),
+            ),
+            reversion_info,
+        );
+    }
+
     // Call context
 
     pub(crate) fn call_context(
@@ -1134,6 +1292,33 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         let word = self.query_word_rlc();
         self.call_context_lookup(false.expr(), call_id, field_tag, word.expr());
         word
+    }
+
+    // same as call_context_lookup_write with bypassing external rwc
+    // Note: will not bumping internal rwc
+    pub(crate) fn call_context_lookup_write_with_counter(
+        &mut self,
+        rw_counter: Expression<F>,
+        call_id: Option<Expression<F>>,
+        field_tag: CallContextFieldTag,
+        value: Expression<F>,
+    ) {
+        self.rw_lookup_with_counter(
+            "CallContext lookup",
+            rw_counter,
+            1.expr(),
+            RwTableTag::CallContext,
+            RwValues::new(
+                call_id.unwrap_or_else(|| self.curr.state.call_id.expr()),
+                0.expr(),
+                field_tag.expr(),
+                0.expr(),
+                value,
+                0.expr(),
+                0.expr(),
+                0.expr(),
+            ),
+        );
     }
 
     pub(crate) fn call_context_lookup(
@@ -1478,6 +1663,24 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         );
     }
 
+    // SHA256 Table
+
+    pub(crate) fn sha256_table_lookup(
+        &mut self,
+        input_rlc: Expression<F>,
+        input_len: Expression<F>,
+        output_rlc: Expression<F>,
+    ) {
+        self.add_lookup(
+            "sha256 lookup",
+            Lookup::Sha256Table {
+                input_rlc,
+                input_len,
+                output_rlc,
+            },
+        );
+    }
+
     // ModExp table
     pub(crate) fn modexp_table_lookup(
         &mut self,
@@ -1543,60 +1746,13 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         ret
     }
 
-    /// Constraints the next step, given mutually exclusive conditions to determine the next state
-    /// and constrain it using the provided respective constraint. This mechanism is specifically
-    /// used for constraining the internal states for precompile calls. Each precompile call
-    /// expects a different cell layout, but since the next state can be at the most one precompile
-    /// state, we can re-use cells assigned across all those conditions.
-    pub(crate) fn constrain_mutually_exclusive_next_step(
-        &mut self,
-        conditions: Vec<Expression<F>>,
-        next_states: Vec<ExecutionState>,
-        constraints: Vec<BoxedClosure<F>>,
-    ) {
-        assert_eq!(conditions.len(), constraints.len());
-        assert_eq!(conditions.len(), next_states.len());
-        self.require_boolean(
-            "at the most one condition is true from mutually exclusive conditions",
-            sum::expr(&conditions),
-        );
-
-        // record the heights of all columns (for the next step) as we begin cell assignment.
-        let start_heights = self.next.cell_manager.get_heights();
-
-        let mut max_end_heights: Vec<usize> = vec![0usize; start_heights.len()];
-        for ((&next_state, condition), constraint) in next_states
-            .iter()
-            .zip(conditions.into_iter())
-            .zip(constraints.into_iter())
-        {
-            // constraint the next step.
-            self.constrain_next_step(next_state, Some(condition), constraint);
-
-            // get the column heights at the end of querying cells in the above constraints.
-            let end_heights = self.next.cell_manager.get_heights();
-            for (max_end_height, end_height) in max_end_heights.iter_mut().zip(end_heights.iter()) {
-                if end_height > max_end_height {
-                    *max_end_height = *end_height;
-                }
-            }
-
-            // reset the column heights of the next step before proceeding to the next mutually
-            // exclusive condition/constraint/next_state.
-            self.next.cell_manager.reset_heights_to(&start_heights);
-        }
-
-        // reset height of next step to the maximum heights of each column.
-        self.next.cell_manager.reset_heights_to(&max_end_heights);
-    }
-
     /// This function needs to be used with extra precaution. You need to make
     /// sure the layout is the same as the gadget for `next_step_state`.
     /// `query_cell` will return cells in the next step in the `constraint`
     /// function.
     pub(crate) fn constrain_next_step<R>(
         &mut self,
-        next_step_state: ExecutionState,
+        opt_next_step_state: Option<ExecutionState>,
         condition: Option<Expression<F>>,
         constraint: impl FnOnce(&mut Self) -> R,
     ) -> R {
@@ -1604,11 +1760,15 @@ impl<'a, F: Field> EVMConstraintBuilder<'a, F> {
         self.in_next_step = true;
         let ret = match condition {
             None => {
-                self.require_next_state(next_step_state);
+                if let Some(next_step_state) = opt_next_step_state {
+                    self.require_next_state(next_step_state);
+                }
                 constraint(self)
             }
             Some(cond) => self.condition(cond, |cb| {
-                cb.require_next_state(next_step_state);
+                if let Some(next_step_state) = opt_next_step_state {
+                    cb.require_next_state(next_step_state);
+                }
                 constraint(cb)
             }),
         };

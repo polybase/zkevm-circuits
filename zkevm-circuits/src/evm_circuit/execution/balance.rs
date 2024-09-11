@@ -16,9 +16,9 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::{AccountFieldTag, CallContextFieldTag},
-    util::Expr,
+    util::{Expr, Field},
 };
-use eth_types::{evm_types::GasCost, Field, ToLittleEndian};
+use eth_types::{evm_types::GasCost, ToLittleEndian};
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 #[derive(Clone, Debug)]
@@ -102,12 +102,13 @@ impl<F: Field> ExecutionGadget<F> for BalanceGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         tx: &Transaction,
         call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         let address = block.rws[step.rw_indices[0]].stack_value();
         self.address_word
@@ -148,12 +149,11 @@ impl<F: Field> ExecutionGadget<F> for BalanceGadget<F> {
 mod test {
     use crate::{evm_circuit::test::rand_bytes, test_util::CircuitTestBuilder};
     use eth_types::{address, bytecode, geth_types::Account, Address, Bytecode, Word, U256};
-    use lazy_static::lazy_static;
     use mock::{generate_mock_call_bytecode, test_ctx::TestContext, MockCallBytecodeParams};
+    use std::sync::LazyLock;
 
-    lazy_static! {
-        static ref TEST_ADDRESS: Address = address!("0xaabbccddee000000000000000000000000000000");
-    }
+    static TEST_ADDRESS: LazyLock<Address> =
+        LazyLock::new(|| address!("0xaabbccddee000000000000000000000000000000"));
 
     #[test]
     fn balance_gadget_non_existing_account() {

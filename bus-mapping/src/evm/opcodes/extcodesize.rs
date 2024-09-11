@@ -18,9 +18,10 @@ impl Opcode for Extcodesize {
         let mut exec_step = state.new_step(geth_step)?;
 
         // Read account address from stack.
-        let address_word = geth_step.stack.last()?;
+        let address_word = state.stack_pop(&mut exec_step)?;
         let address = address_word.to_address();
-        state.stack_read(&mut exec_step, geth_step.stack.last_filled(), address_word)?;
+        #[cfg(feature = "enable-stack")]
+        assert_eq!(address_word, geth_step.stack.last()?);
 
         // Read transaction ID, rw_counter_end_of_reversion, and is_persistent from call
         // context.
@@ -56,7 +57,15 @@ impl Opcode for Extcodesize {
         let (code_hash, code_size) = if exists {
             (
                 account.code_hash,
-                state.code(account.code_hash)?.len().into(),
+                if cfg!(feature = "scroll") {
+                    //debug_assert_eq!(
+                    //    account.code_size,
+                    //    state.code(account.code_hash)?.len().into()
+                    //);
+                    account.code_size
+                } else {
+                    state.code(account.code_hash)?.len().into()
+                },
             )
         } else {
             (H256::zero(), Word::zero())
@@ -77,12 +86,9 @@ impl Opcode for Extcodesize {
         }
 
         // Write the EXTCODESIZE result to stack.
-        debug_assert_eq!(code_size, geth_steps[1].stack.last()?);
-        state.stack_write(
-            &mut exec_step,
-            geth_steps[1].stack.nth_last_filled(0),
-            code_size,
-        )?;
+        #[cfg(feature = "enable-stack")]
+        assert_eq!(code_size, geth_steps[1].stack.last()?);
+        state.stack_push(&mut exec_step, code_size)?;
 
         Ok(vec![exec_step])
     }
@@ -95,12 +101,12 @@ mod extcodesize_tests {
         circuit_input_builder::ExecState,
         mock::BlockData,
         operation::{AccountOp, CallContextOp, StackOp, RW},
-        state_db::CodeDB,
     };
     use eth_types::{
         bytecode,
         evm_types::{OpcodeId, StackAddress},
         geth_types::{Account, GethData},
+        state_db::CodeDB,
         Bytecode, U256,
     };
     use mock::{TestContext, MOCK_1_ETH, MOCK_ACCOUNTS, MOCK_CODES, MOCK_COINBASE};

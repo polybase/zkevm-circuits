@@ -19,7 +19,8 @@ use crate::{
     util::Expr,
 };
 
-use eth_types::{evm_types::OpcodeId, Field, ToLittleEndian, U256};
+use crate::util::Field;
+use eth_types::{evm_types::OpcodeId, ToLittleEndian, U256};
 use halo2_proofs::plonk::Error;
 
 // MemoryGadget handles mload/mstore/mstore8 op codes gadget
@@ -29,7 +30,7 @@ pub(crate) struct MemoryGadget<F> {
     address: MemoryWordAddress<F>,
     mask: MemoryMask<F>,
     // consider move to MemoryWordAddress ?
-    /// The value poped from or pushed to the stack.
+    /// The value popped from or pushed to the stack.
     value: Word<F>,
     /// The left memory word read or written.
     value_left: Word<F>,
@@ -162,12 +163,13 @@ impl<F: Field> ExecutionGadget<F> for MemoryGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _tx: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         let opcode = step.opcode.unwrap();
 

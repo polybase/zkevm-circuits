@@ -7,12 +7,10 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-halo2_proofs.workspace = true
-mpt-circuits = { package = "halo2-mpt-circuits", git = "https://github.com/scroll-tech/mpt-circuit.git", tag = "v0.7.0" }
-zktrie = { git = "https://github.com/polybase/zktrie/", branch = "bypass-builds-on-android-and-ios"}
-hash-circuit.workspace = true
+halo2curves.workspace = true
+zktrie = { git = "https://github.com/polybase/zktrie/", branch = "develop-polybase-upgrade"}
+poseidon-base.workspace = true
 eth-types = { path = "../eth-types" }
-lazy_static.workspace = true
 num-bigint.workspace = true
 log.workspace = true
 hex.workspace = true

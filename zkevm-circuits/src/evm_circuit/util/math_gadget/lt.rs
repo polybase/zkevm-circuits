@@ -6,9 +6,8 @@ use crate::{
             from_bytes, pow_of_two, transpose_val_ret, CachedRegion, Cell,
         },
     },
-    util::Expr,
+    util::{Expr, Field},
 };
-use eth_types::Field;
 use halo2_proofs::{
     circuit::Value,
     plonk::{Error, Expression},
@@ -106,6 +105,7 @@ impl<F: Field, const N_BYTES: usize> LtGadget<F, N_BYTES> {
 #[cfg(test)]
 mod tests {
     use super::{super::test_util::*, *};
+    use crate::util::Field;
     use eth_types::*;
     use halo2_proofs::{halo2curves::bn256::Fr, plonk::Error};
 
@@ -152,12 +152,12 @@ mod tests {
     fn test_lt_expect() {
         try_test!(
             LtGadgetTestContainer<Fr>,
-            vec![Word::from(0), Word::from(1)],
+            [Word::from(0), Word::from(1)],
             true,
         );
         try_test!(
             LtGadgetTestContainer<Fr>,
-            vec![Word::from(0), Word::from(0)],
+            [Word::from(0), Word::from(0)],
             false,
         );
     }
@@ -166,7 +166,7 @@ mod tests {
     fn test_lt_just_in_range() {
         try_test!(
             LtGadgetTestContainer<Fr>,
-            vec![Word::from(1), Word::from((1u64 << (N * 8)) - 1)],
+            [Word::from(1), Word::from((1u64 << (N * 8)) - 1)],
             true,
         );
     }
@@ -175,7 +175,7 @@ mod tests {
     fn test_lt_out_of_range() {
         try_test!(
             LtGadgetTestContainer<Fr>,
-            vec![Word::from(1), Word::from(2 << (N * 8))],
+            [Word::from(1), Word::from(2 << (N * 8))],
             false,
         );
     }

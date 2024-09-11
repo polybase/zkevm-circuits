@@ -3,9 +3,8 @@ pub use super::ExpCircuit;
 use crate::{
     exp_circuit::{ExpCircuitArgs, ExpCircuitConfig},
     table::{ExpTable, U16Table},
-    util::{Challenges, SubCircuit, SubCircuitConfig},
+    util::{Challenges, Field, SubCircuit, SubCircuitConfig},
 };
-use eth_types::Field;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner},
     plonk::{Circuit, ConstraintSystem, Error},
@@ -14,6 +13,8 @@ use halo2_proofs::{
 impl<F: Field> Circuit<F> for ExpCircuit<F> {
     type Config = (ExpCircuitConfig<F>, Challenges);
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self::default()

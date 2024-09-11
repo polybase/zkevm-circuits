@@ -19,8 +19,10 @@ use crate::{
     table::CallContextFieldTag,
     util::Expr,
 };
+use gadgets::ToScalar;
 
-use eth_types::{evm_types::GasCost, Field, ToScalar};
+use crate::util::Field;
+use eth_types::evm_types::GasCost;
 use halo2_proofs::{
     circuit::Value,
     plonk::{Error, Expression},
@@ -55,7 +57,7 @@ impl<F: Field> ExecutionGadget<F> for SstoreGadget<F> {
 
         let tx_id = cb.call_context(None, CallContextFieldTag::TxId);
 
-        // constrain not in static call
+        // Constrain we're not in a STATICCALL context.
         let is_static = cb.call_context(None, CallContextFieldTag::IsStatic);
         cb.require_zero("is_static is false", is_static.expr());
 
@@ -165,12 +167,13 @@ impl<F: Field> ExecutionGadget<F> for SstoreGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         tx: &Transaction,
         call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         self.tx_id
             .assign(region, offset, Value::known(F::from(tx.id as u64)))?;
@@ -308,11 +311,11 @@ impl<F: Field> SstoreTxRefundGadget<F> {
             - recreate_slot * (GasCost::SSTORE_CLEARS_SCHEDULE.expr());
 
         Self {
+            tx_refund_old,
+            tx_refund_new,
             value,
             value_prev,
             original_value,
-            tx_refund_old,
-            tx_refund_new,
             value_prev_is_zero_gadget,
             value_is_zero_gadget,
             original_is_zero_gadget,
@@ -380,59 +383,7 @@ impl<F: Field> SstoreTxRefundGadget<F> {
     }
 }
 
-fn calc_expected_tx_refund(
-    tx_refund_old: u64,
-    value: eth_types::Word,
-    value_prev: eth_types::Word,
-    original_value: eth_types::Word,
-) -> u64 {
-    // Same clause tags(like "delete slot (2.1.2b)") used as [`makeGasSStoreFunc` in go-ethereum](https://github.com/ethereum/go-ethereum/blob/9fd8825d5a196edde6d8ef81382979875145b346/core/vm/operations_acl.go#L27)
-    // Control flow of this function try to follow `makeGasSStoreFunc` for better
-    // understanding and comparison.
-
-    let mut tx_refund_new = tx_refund_old;
-
-    // The "clearing slot refund" and "resetting value refund" are ADDED together,
-    // they are NOT MUTUALLY EXCLUSIVE.
-    // Search "Apply both of the following clauses" in EIP-2200 for more details.
-    // There can be five total kinds of refund:
-    // 1. -SSTORE_CLEARS_SCHEDULE
-    // 2. SSTORE_CLEARS_SCHEDULE
-    // 3. SSTORE_SET - WARM_ACCESS
-    // 4. SSTORE_RESET - WARM_ACCESS
-    // 5. -SSTORE_CLEARS_SCHEDULE + SSTORE_RESET - WARM_ACCESS
-    // The last case can happen if (original_value, prev_value, value) be (v,0,v)
-    // where v != 0,
-    // then both "clearing slot refund" and "resetting value refund" are non zero.
-
-    if value_prev != value {
-        // refund related to clearing slot
-        // "delete slot (2.1.2b)" can be safely merged in "delete slot (2.2.1.2)"
-        if !original_value.is_zero() {
-            if value_prev.is_zero() {
-                // recreate slot (2.2.1.1)
-                tx_refund_new -= GasCost::SSTORE_CLEARS_SCHEDULE.as_u64()
-            }
-            if value.is_zero() {
-                // delete slot (2.2.1.2)
-                tx_refund_new += GasCost::SSTORE_CLEARS_SCHEDULE.as_u64()
-            }
-        }
-
-        // refund related to resetting value
-        if original_value == value {
-            if original_value.is_zero() {
-                // reset to original inexistent slot (2.2.2.1)
-                tx_refund_new += GasCost::SSTORE_SET.as_u64() - GasCost::WARM_ACCESS.as_u64();
-            } else {
-                // reset to original existing slot (2.2.2.2)
-                tx_refund_new += GasCost::SSTORE_RESET.as_u64() - GasCost::WARM_ACCESS.as_u64();
-            }
-        }
-    }
-
-    tx_refund_new
-}
+use bus_mapping::evm::calc_expected_tx_refund;
 
 #[cfg(test)]
 mod test {

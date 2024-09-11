@@ -7,13 +7,13 @@ pub use super::TxCircuit;
 use crate::{
     sig_circuit::{SigCircuit, SigCircuitConfig, SigCircuitConfigArgs},
     table::{
-        BlockTable, KeccakTable, RlpFsmRlpTable as RlpTable, SigTable, TxTable, U16Table, U8Table,
+        BlockTable, KeccakTable, PowOfRandTable, RlpFsmRlpTable as RlpTable, SigTable, TxTable,
+        U16Table, U8Table,
     },
     tx_circuit::{TxCircuitConfig, TxCircuitConfigArgs},
-    util::{Challenges, SubCircuit, SubCircuitConfig},
+    util::{Challenges, Field, SubCircuit, SubCircuitConfig},
     witness::Transaction,
 };
-use eth_types::Field;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner},
     plonk::{Circuit, ConstraintSystem, Error, Expression},
@@ -35,6 +35,8 @@ pub struct TxCircuitTesterConfigArgs<F: Field> {
     pub u8_table: U8Table,
     /// u16 lookup table,
     pub u16_table: U16Table,
+    /// power of rand lookup table,
+    pub pow_of_rand_table: PowOfRandTable,
     /// Challenges
     pub challenges: Challenges<Expression<F>>,
 }
@@ -64,6 +66,7 @@ impl<F: Field> SubCircuitConfig<F> for TxCircuitTesterConfig<F> {
             sig_table,
             u8_table,
             u16_table,
+            pow_of_rand_table,
             challenges,
         }: Self::ConfigArgs,
     ) -> Self {
@@ -78,13 +81,14 @@ impl<F: Field> SubCircuitConfig<F> for TxCircuitTesterConfig<F> {
         let tx_config = TxCircuitConfig::new(
             meta,
             TxCircuitConfigArgs {
-                sig_table,
-                block_table,
                 tx_table,
+                block_table,
                 keccak_table,
                 rlp_table,
+                sig_table,
                 u8_table,
                 u16_table,
+                pow_of_rand_table,
                 challenges,
             },
         );
@@ -127,7 +131,7 @@ impl<F: Field> TxCircuitTester<F> {
 impl<F: Field> SubCircuit<F> for TxCircuitTester<F> {
     type Config = TxCircuitTesterConfig<F>;
 
-    fn new_from_block(block: &crate::witness::Block<F>) -> Self {
+    fn new_from_block(block: &crate::witness::Block) -> Self {
         let txs = block.txs.clone();
         let max_txs = block.circuits_params.max_txs;
         let chain_id = block.chain_id;
@@ -145,9 +149,9 @@ impl<F: Field> SubCircuit<F> for TxCircuitTester<F> {
         unimplemented!("not needed")
     }
 
-    fn min_num_rows_block(block: &crate::witness::Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &crate::witness::Block) -> (usize, usize) {
         // TODO
-        SigCircuit::min_num_rows_block(block)
+        SigCircuit::<F>::min_num_rows_block(block)
     }
 }
 
@@ -155,6 +159,8 @@ impl<F: Field> SubCircuit<F> for TxCircuitTester<F> {
 impl<F: Field> Circuit<F> for TxCircuitTester<F> {
     type Config = (TxCircuitTesterConfig<F>, Challenges);
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self::default()
@@ -170,6 +176,9 @@ impl<F: Field> Circuit<F> for TxCircuitTester<F> {
         let u16_table = U16Table::construct(meta);
         let challenges = Challenges::construct(meta);
 
+        let challenges_expr = challenges.exprs(meta);
+        let pow_of_rand_table = PowOfRandTable::construct(meta, &challenges_expr);
+
         let config = {
             let challenges = challenges.exprs(meta);
             let sig_config = SigCircuitConfig::new(
@@ -183,13 +192,14 @@ impl<F: Field> Circuit<F> for TxCircuitTester<F> {
             let tx_config = TxCircuitConfig::new(
                 meta,
                 TxCircuitConfigArgs {
-                    sig_table,
-                    block_table,
                     tx_table,
+                    block_table,
                     keccak_table,
                     rlp_table,
+                    sig_table,
                     u8_table,
                     u16_table,
+                    pow_of_rand_table,
                     challenges,
                 },
             );
@@ -214,7 +224,6 @@ impl<F: Field> Circuit<F> for TxCircuitTester<F> {
         config.u16_table.load(&mut layouter)?;
 
         let padding_txs = (self.tx_circuit.txs.len()..self.tx_circuit.max_txs)
-            .into_iter()
             .map(|i| {
                 let mut tx = Transaction::dummy(self.tx_circuit.chain_id);
                 tx.id = i + 1;
@@ -227,6 +236,11 @@ impl<F: Field> Circuit<F> for TxCircuitTester<F> {
             &self.tx_circuit.keccak_inputs()?,
             &challenges,
         )?;
+
+        config
+            .tx_config
+            .pow_of_rand_table
+            .assign(&mut layouter, &challenges, 4094 * 31)?;
         config.tx_config.rlp_table.dev_load(
             &mut layouter,
             self.tx_circuit

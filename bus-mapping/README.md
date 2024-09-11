@@ -27,7 +27,7 @@ prover to pick any location here and in the EVM proof confirm it is correct.
 time. It checks the validity of these opcodes. It also confirms that for
 each of these opcodes the state proof performed the correct operation.
 
-Only after verifying both proofs are we confident that that Ethereum block
+Only after verifying both proofs are we confident that the Ethereum block
 is executed correctly.
 
 ### Bus Mapping
@@ -158,7 +158,7 @@ On that way, we would get something like this for the Memory ops:
 | `key`  | `val`         | `rw`    | `gc` | Note                                     |
 |:------:| ------------- | ------- | ---- | ---------------------------------------- |
 | `0x40` | `0`           | `Write` |      | Init                                     |
-| `0x40` | `0x80`        | `Write` | 0    | Assume written at the begining of `code` |
+| `0x40` | `0x80`        | `Write` | 0    | Assume written at the beginning of `code`|
 | `0x40` | `0x80`        | `Read`  | 4    | `56 MLOAD`                               |
 |   -    |               |         |      |                                          |
 | `0x80` | `0`           | `Write` |      | Init                                     |

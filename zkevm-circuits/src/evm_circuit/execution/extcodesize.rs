@@ -16,9 +16,9 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::{AccountFieldTag, CallContextFieldTag},
-    util::Expr,
+    util::{Expr, Field},
 };
-use eth_types::{evm_types::GasCost, Field, ToLittleEndian};
+use eth_types::{evm_types::GasCost, ToLittleEndian};
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 #[derive(Clone, Debug)]
@@ -102,8 +102,8 @@ impl<F: Field> ExecutionGadget<F> for ExtcodesizeGadget<F> {
         Self {
             same_context,
             address_word,
-            tx_id,
             reversion_info,
+            tx_id,
             is_warm,
             code_hash,
             not_exists,
@@ -115,12 +115,13 @@ impl<F: Field> ExecutionGadget<F> for ExtcodesizeGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         tx: &Transaction,
         call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         let address = block.rws[step.rw_indices[0]].stack_value();
         self.address_word

@@ -13,6 +13,7 @@ import (
 	"github.com/scroll-tech/go-ethereum/core/types"
 	"github.com/scroll-tech/go-ethereum/core/vm"
 	"github.com/scroll-tech/go-ethereum/params"
+	"github.com/scroll-tech/go-ethereum/rollup/tracing"
 	"github.com/scroll-tech/go-ethereum/trie"
 )
 
@@ -33,30 +34,27 @@ type Account struct {
 }
 
 type Transaction struct {
-	From       common.Address  `json:"from"`
-	To         *common.Address `json:"to"`
-	Nonce      hexutil.Uint64  `json:"nonce"`
-	Value      *hexutil.Big    `json:"value"`
-	GasLimit   hexutil.Uint64  `json:"gas_limit"`
-	GasPrice   *hexutil.Big    `json:"gas_price"`
-	GasFeeCap  *hexutil.Big    `json:"gas_fee_cap"`
-	GasTipCap  *hexutil.Big    `json:"gas_tip_cap"`
-	CallData   hexutil.Bytes   `json:"call_data"`
-	AccessList []struct {
-		Address     common.Address `json:"address"`
-		StorageKeys []common.Hash  `json:"storage_keys"`
-	} `json:"access_list"`
-	Type string       `json:"tx_type"`
-	V    int64        `json:"v"`
-	R    *hexutil.Big `json:"r"`
-	S    *hexutil.Big `json:"s"`
+	From       common.Address   `json:"from"`
+	To         *common.Address  `json:"to"`
+	Nonce      hexutil.Uint64   `json:"nonce"`
+	Value      *hexutil.Big     `json:"value"`
+	GasLimit   hexutil.Uint64   `json:"gas_limit"`
+	GasPrice   *hexutil.Big     `json:"gas_price"`
+	GasFeeCap  *hexutil.Big     `json:"gas_fee_cap"`
+	GasTipCap  *hexutil.Big     `json:"gas_tip_cap"`
+	CallData   hexutil.Bytes    `json:"call_data"`
+	AccessList types.AccessList `json:"access_list"`
+	Type       string           `json:"tx_type"`
+	V          int64            `json:"v"`
+	R          *hexutil.Big     `json:"r"`
+	S          *hexutil.Big     `json:"s"`
 }
 
 type TraceConfig struct {
 	ChainID           uint64 `json:"chain_id"`
 	StartL1QueueIndex uint64 `json:"l1_queue_index"`
 	// HistoryHashes contains most recent 256 block hashes in history,
-	// where the lastest one is at HistoryHashes[len(HistoryHashes)-1].
+	// where the latest one is at HistoryHashes[len(HistoryHashes)-1].
 	HistoryHashes []*hexutil.Big             `json:"history_hashes"`
 	Block         Block                      `json:"block_constants"`
 	Accounts      map[common.Address]Account `json:"accounts"`
@@ -74,11 +72,11 @@ func toBigInt(value *hexutil.Big) *big.Int {
 	return big.NewInt(0)
 }
 
-func transferTxs(txs []Transaction) types.Transactions {
+func transferTxs(txs []Transaction, chainID *big.Int) types.Transactions {
 
 	t_txs := make([]*types.Transaction, 0, len(txs))
 	for _, tx := range txs {
-
+		// fmt.Println("tx is %v", tx)
 		// if no signature, we can only handle it as l1msg tx
 		// notice the type is defined in geth_types
 		if tx.Type == "L1Msg" || tx.R == nil || tx.R.ToInt().Cmp(big.NewInt(0)) == 0 {
@@ -95,31 +93,50 @@ func transferTxs(txs []Transaction) types.Transactions {
 
 			switch tx.Type {
 			case "Eip155":
-				legacyTx := &types.LegacyTx{
+				t := &types.LegacyTx{
 					Nonce:    uint64(tx.Nonce),
+					GasPrice: toBigInt(tx.GasPrice),
+					Gas:      uint64(tx.GasLimit),
 					To:       tx.To,
 					Value:    toBigInt(tx.Value),
-					Gas:      uint64(tx.GasLimit),
-					GasPrice: toBigInt(tx.GasPrice),
 					Data:     tx.CallData,
 					V:        big.NewInt(tx.V),
 					R:        tx.R.ToInt(),
 					S:        tx.S.ToInt(),
 				}
-				t_txs = append(t_txs, types.NewTx(legacyTx))
+				t_txs = append(t_txs, types.NewTx(t))
+			case "Eip2930":
+				t := &types.AccessListTx{
+					ChainID:    chainID,
+					Nonce:      uint64(tx.Nonce),
+					GasPrice:   toBigInt(tx.GasPrice),
+					Gas:        uint64(tx.GasLimit),
+					To:         tx.To,
+					Value:      toBigInt(tx.Value),
+					Data:       tx.CallData,
+					AccessList: tx.AccessList,
+					V:          big.NewInt(tx.V),
+					R:          tx.R.ToInt(),
+					S:          tx.S.ToInt(),
+				}
+				t_txs = append(t_txs, types.NewTx(t))
+			case "Eip1559":
+				t := &types.DynamicFeeTx{
+					ChainID:    chainID,
+					Nonce:      uint64(tx.Nonce),
+					GasTipCap:  (*big.Int)(tx.GasTipCap),
+					GasFeeCap:  (*big.Int)(tx.GasFeeCap),
+					Gas:        uint64(tx.GasLimit),
+					To:         tx.To,
+					Value:      toBigInt(tx.Value),
+					Data:       tx.CallData,
+					AccessList: tx.AccessList,
+					V:          big.NewInt(tx.V),
+					R:          tx.R.ToInt(),
+					S:          tx.S.ToInt(),
+				}
+				t_txs = append(t_txs, types.NewTx(t))
 			default:
-				// If gas price is specified directly, the tx is treated as legacy type.
-				// if tx.GasPrice != nil {
-				// 	tx.GasFeeCap = tx.GasPrice
-				// 	tx.GasTipCap = tx.GasPrice
-				// }
-
-				// txAccessList := make(types.AccessList, len(tx.AccessList))
-				// for i, accessList := range tx.AccessList {
-				// 	txAccessList[i].Address = accessList.Address
-				// 	txAccessList[i].StorageKeys = accessList.StorageKeys
-				// }
-
 				panic(fmt.Errorf("not implement tx type [%s]", tx.Type))
 			}
 
@@ -148,6 +165,16 @@ func Trace(config TraceConfig) (*types.BlockTrace, error) {
 		BerlinBlock:         big.NewInt(0),
 		LondonBlock:         big.NewInt(0),
 		ShanghaiBlock:       big.NewInt(0),
+
+		TerminalTotalDifficulty: big.NewInt(0),
+
+		// Scroll configs
+		ArchimedesBlock: big.NewInt(0),
+		BernoulliBlock:  big.NewInt(0),
+		CurieBlock:      big.NewInt(0),
+		Scroll: params.ScrollConfig{
+			FeeVaultAddress: &config.Block.Coinbase,
+		},
 	}
 
 	if config.ChainConfig != nil {
@@ -158,7 +185,7 @@ func Trace(config TraceConfig) (*types.BlockTrace, error) {
 	// fmt.Printf("geth-utils: ShanghaiBlock = %d\n", chainConfig.ShanghaiBlock)
 	// fmt.Printf("geth-utils: ArchimedesBlock = %d\n", chainConfig.ArchimedesBlock)
 
-	txs := transferTxs(config.Transactions)
+	txs := transferTxs(config.Transactions, chainConfig.ChainID)
 
 	var txsGasLimit uint64
 	blockGasLimit := toBigInt(config.Block.GasLimit).Uint64()
@@ -205,6 +232,7 @@ func Trace(config TraceConfig) (*types.BlockTrace, error) {
 		GasLimit:   toBigInt(config.Block.GasLimit).Uint64(),
 		Extra:      []byte{},
 		Time:       toBigInt(config.Block.Timestamp).Uint64(),
+		BaseFee:    toBigInt(config.Block.BaseFee),
 	}
 	block := types.NewBlockWithHeader(header).WithBody(txs, nil)
 
@@ -230,7 +258,7 @@ func Trace(config TraceConfig) (*types.BlockTrace, error) {
 		return nil, err
 	}
 
-	traceEnv := core.CreateTraceEnvHelper(
+	traceEnv := tracing.CreateTraceEnvHelper(
 		&chainConfig,
 		config.LoggerConfig,
 		blockCtx,

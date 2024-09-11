@@ -1,26 +1,28 @@
 use crate::{
     evm_circuit::{util::rlc, witness::Rw},
     table::AccountFieldTag,
+    util::Field,
 };
-use eth_types::{Address, Field, ToLittleEndian, ToScalar, Word, U256};
+use eth_types::{Address, ToLittleEndian, ToWord, Word, H256};
+use gadgets::ToScalar;
 use halo2_proofs::circuit::Value;
 use itertools::Itertools;
-#[cfg(test)]
-use mpt_zktrie::state::builder::HASH_SCHEME_DONE;
-use mpt_zktrie::{
-    mpt_circuits::{serde::SMTTrace, MPTProofType},
-    state,
-    state::witness::WitnessGenerator,
-};
+use mpt_circuits::{serde::SMTTrace, MPTProofType};
+use mpt_zktrie::{state, state::builder::init_hash_scheme};
 use serde::{Deserialize, Serialize};
 pub use state::ZktrieState;
 use std::collections::BTreeMap;
+
+#[cfg(test)]
+mod test;
+mod witness;
+use witness::WitnessGenerator;
 
 /// Used to store withdraw proof
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct WithdrawProof {
     /// state root after a block
-    pub state_root: U256,
+    pub state_root: H256,
     /// account proof for withdraw bridge contract
     pub account_proof: Vec<Vec<u8>>,
     /// storage proof for withdraw bridge contract, withdraw root storage key
@@ -93,8 +95,8 @@ impl Default for MptUpdate {
 /// All the MPT updates in the MptCircuit, accessible by their key
 #[derive(Default, Clone, Debug)]
 pub struct MptUpdates {
-    old_root: Word,
-    new_root: Word,
+    old_root: H256,
+    new_root: H256,
     updates: BTreeMap<Key, MptUpdate>,
     /// TODO: is here the best place for this?
     /// Withdraw proof after this block
@@ -113,11 +115,11 @@ impl MptUpdates {
         self.updates.len()
     }
 
-    pub(crate) fn old_root(&self) -> Word {
+    pub(crate) fn old_root(&self) -> H256 {
         self.old_root
     }
 
-    pub(crate) fn new_root(&self) -> Word {
+    pub(crate) fn new_root(&self) -> H256 {
         self.new_root
     }
 
@@ -130,54 +132,65 @@ impl MptUpdates {
         })
     }
 
-    #[cfg(test)]
     /// initialize a mock witness generator that is consistent with the old values of self.updates
-    pub fn mock_fill_state_roots(&mut self) {
-        assert!(*HASH_SCHEME_DONE);
-        let mut wit_gen = WitnessGenerator::from(&ZktrieState::default());
+    /// Update 2024.05.22: since we implemented "retrace" feature, this method is no longer useful
+    /// https://github.com/scroll-tech/zkevm-circuits/pull/1260
+    #[deprecated]
+    pub(crate) fn build_prestate_trie(&mut self) {
+        init_hash_scheme();
+        let temp_trie = ZktrieState::default();
+        let mut wit_gen = WitnessGenerator::from(&temp_trie);
+        let mut storage_touched = std::collections::HashSet::<(&Address, &Word)>::new();
         for (key, update) in &mut self.updates {
+            // we should only handle the storage key occur for the first time
+            if let Key::AccountStorage {
+                storage_key,
+                address,
+                ..
+            } = key
+            {
+                if !storage_touched.insert((address, storage_key)) {
+                    continue;
+                }
+            }
             let key = key.set_non_exists(Word::zero(), update.old_value);
-            self.old_root = U256::from_little_endian(
-                wit_gen
-                    .handle_new_state(
-                        update.proof_type(),
-                        match key {
-                            Key::Account { address, .. } | Key::AccountStorage { address, .. } => {
-                                address
-                            }
-                        },
-                        update.old_value,
-                        Word::zero(),
-                        match key {
-                            Key::Account { .. } => None,
-                            Key::AccountStorage { storage_key, .. } => Some(storage_key),
-                        },
-                    )
-                    .account_path[1]
-                    .root
-                    .as_ref(),
+            wit_gen.handle_new_state(
+                update.proof_type(),
+                match key {
+                    Key::Account { address, .. } | Key::AccountStorage { address, .. } => address,
+                },
+                update.old_value,
+                Word::zero(),
+                match key {
+                    Key::Account { .. } => None,
+                    Key::AccountStorage { storage_key, .. } => Some(storage_key),
+                },
             );
         }
+        self.old_root = wit_gen.root();
         self.fill_state_roots_from_generator(wit_gen);
+        log::debug!("build_prestate_trie done");
+        self.pretty_print();
     }
 
-    pub(crate) fn fill_state_roots(&mut self, init_trie: &ZktrieState) {
+    pub(crate) fn fill_state_roots(&mut self, init_trie: &ZktrieState) -> WitnessGenerator {
         let root_pair = (self.old_root, self.new_root);
-        self.old_root = U256::from_big_endian(init_trie.root());
-        log::trace!("fill_state_roots init {:?}", init_trie.root());
+        self.old_root = init_trie.root().into();
+        log::trace!("fill_state_roots init {:?}", self.old_root);
 
         let wit_gen = WitnessGenerator::from(init_trie);
         let wit_gen = self.fill_state_roots_from_generator(wit_gen);
 
         let root_pair2 = (self.old_root, self.new_root);
         if root_pair2 != root_pair {
-            log::error!(
+            log::warn!(
                 "roots non consistent ({:#x},{:#x}) vs ({:#x},{:#x})",
                 root_pair.0,
                 root_pair.1,
                 root_pair2.0,
                 root_pair2.1
             );
+            #[cfg(debug_assertions)]
             wit_gen.dump(
                 self.updates
                     .iter()
@@ -197,7 +210,7 @@ impl MptUpdates {
         if gen_withdraw_proof {
             // generate withdraw proof
             let address = *bus_mapping::l2_predeployed::message_queue::ADDRESS;
-            let key = *bus_mapping::l2_predeployed::message_queue::WITHDRAW_TRIE_ROOT_SLOT;
+            let key = bus_mapping::l2_predeployed::message_queue::WITHDRAW_TRIE_ROOT_SLOT;
             let account_proof = wit_gen.account_proof(address);
             let storage_proof = wit_gen.storage_proof(address, key);
             // TODO: add withdraw_root to WithdrawProof?
@@ -211,6 +224,7 @@ impl MptUpdates {
         }
         log::debug!("fill_state_roots done");
         self.pretty_print();
+        wit_gen
     }
 
     fn fill_state_roots_from_generator(
@@ -236,14 +250,16 @@ impl MptUpdates {
                     Key::AccountStorage { storage_key, .. } => Some(storage_key),
                 },
             );
-            log::trace!(
-                "fill_state_roots {:?}->{:?}",
-                smt_trace.account_path[0].root,
-                smt_trace.account_path[1].root
-            );
-            update.old_root = U256::from_little_endian(smt_trace.account_path[0].root.as_ref());
-            update.new_root = U256::from_little_endian(smt_trace.account_path[1].root.as_ref());
-            self.new_root = update.new_root;
+            let mut old_root_bytes = *smt_trace.account_path[0].root.as_ref();
+            old_root_bytes.reverse();
+            let old_root = H256::from(old_root_bytes);
+            let mut new_root_bytes = *smt_trace.account_path[1].root.as_ref();
+            new_root_bytes.reverse();
+            let new_root = H256::from(new_root_bytes);
+            log::trace!("fill_state_roots {:?}->{:?}", old_root, new_root,);
+            update.old_root = old_root.to_word();
+            update.new_root = new_root.to_word();
+            self.new_root = new_root;
             self.smt_traces.push(smt_trace);
             self.proof_types.push(proof_tip);
         }
@@ -256,51 +272,50 @@ impl MptUpdates {
         wit_gen
     }
 
+    /// For testing only
     pub(crate) fn mock_from(rows: &[Rw]) -> Self {
-        Self::from_rws_with_mock_state_roots(rows, 0xcafeu64.into(), 0xdeadbeefu64.into())
+        Self::from_rws_with_state_roots(
+            rows,
+            H256::from_low_u64_be(0xcafeu64),
+            H256::from_low_u64_be(0xdeadbeefu64),
+        )
     }
 
-    pub(crate) fn from_unsorted_rws_with_mock_state_roots(
+    pub(crate) fn from_unsorted_rws_with_state_roots(
         rows: &[Rw],
-        old_root: U256,
-        new_root: U256,
+        old_root: H256,
+        new_root: H256,
     ) -> Self {
-        log::debug!("mpt update roots (mocking) {:?} {:?}", old_root, new_root);
+        log::debug!("mpt update roots {:?} {:?}", old_root, new_root);
         let rows_len = rows.len();
-        let mut updates = BTreeMap::new(); // TODO: preallocate
+        let mut updates: BTreeMap<_, Vec<_>> = BTreeMap::new(); // TODO: preallocate
         for (key, row) in rows.iter().filter_map(|row| key(row).map(|key| (key, row))) {
-            updates.entry(key).or_insert_with(Vec::new).push(*row); // TODO: preallocate
+            updates.entry(key).or_default().push(*row); // TODO: preallocate
         }
         let updates: BTreeMap<_, _> = updates
             .into_iter()
             .enumerate()
             .map(|(i, (key, rows))| {
-                MptUpdate::from_rows(key, rows, i, rows_len, old_root, new_root)
+                MptUpdate::from_rows(
+                    key,
+                    rows,
+                    i,
+                    rows_len,
+                    old_root.to_word(),
+                    new_root.to_word(),
+                )
             })
             .collect();
-        let mpt_updates = MptUpdates {
-            updates,
+        MptUpdates {
             old_root,
             new_root,
+            updates,
             ..Default::default()
-        };
-        // FIXME: we can remove this assert after the code runs a while and everything is ok?
-        #[cfg(debug_assertions)]
-        {
-            let mut rows = rows.to_vec();
-            rows.sort_by_key(Rw::as_key);
-            let old_updates = Self::from_rws_with_mock_state_roots(&rows, old_root, new_root);
-            assert_eq!(old_updates.updates, mpt_updates.updates);
         }
-        mpt_updates
     }
 
-    pub(crate) fn from_rws_with_mock_state_roots(
-        rows: &[Rw],
-        old_root: U256,
-        new_root: U256,
-    ) -> Self {
-        log::debug!("mpt update roots (mocking) {:?} {:?}", old_root, new_root);
+    pub(crate) fn from_rws_with_state_roots(rows: &[Rw], old_root: H256, new_root: H256) -> Self {
+        log::debug!("mpt update roots {:?} {:?}", old_root, new_root);
         let rows_len = rows.len();
         let updates: BTreeMap<_, _> = rows
             .iter()
@@ -310,13 +325,20 @@ impl MptUpdates {
             .enumerate()
             .map(|(i, (key, rows))| {
                 let rows: Vec<Rw> = rows.copied().collect_vec();
-                MptUpdate::from_rows(key, rows, i, rows_len, old_root, new_root)
+                MptUpdate::from_rows(
+                    key,
+                    rows,
+                    i,
+                    rows_len,
+                    old_root.to_word(),
+                    new_root.to_word(),
+                )
             })
             .collect();
         MptUpdates {
-            updates,
             old_root,
             new_root,
+            updates,
             ..Default::default()
         }
     }
@@ -537,997 +559,5 @@ fn value_prev(row: &Rw) -> Word {
         Rw::Account { value_prev, .. } => *value_prev,
         Rw::AccountStorage { value_prev, .. } => *value_prev,
         _ => unreachable!(),
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use mpt_zktrie::state::builder::HASH_SCHEME_DONE;
-
-    #[test]
-    fn invalid_state_from_reading_nonce() {
-        assert!(*HASH_SCHEME_DONE,);
-
-        let key = Key::Account {
-            address: Address::zero(),
-            field_tag: AccountFieldTag::Nonce,
-        };
-        let update = MptUpdate {
-            key,
-            new_root: Word::one(),
-            ..Default::default()
-        };
-
-        let mut updates = MptUpdates::default();
-        updates.updates.insert(key, update);
-
-        updates.fill_state_roots(&ZktrieState::default());
-    }
-
-    #[test]
-    fn invalid_state_from_reading_balance() {
-        assert!(*HASH_SCHEME_DONE,);
-
-        let key = Key::Account {
-            address: Address::zero(),
-            field_tag: AccountFieldTag::Balance,
-        };
-        let update = MptUpdate {
-            key,
-            new_root: Word::one(),
-            ..Default::default()
-        };
-
-        let mut updates = MptUpdates::default();
-        updates.updates.insert(key, update);
-
-        updates.fill_state_roots(&ZktrieState::default());
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces[0]).unwrap()
-        );
-    }
-
-    fn nonce_update(address: Address) -> MptUpdate {
-        MptUpdate {
-            key: Key::Account {
-                address,
-                field_tag: AccountFieldTag::Nonce,
-            },
-            new_value: Word::one(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn nonce_update_existing() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 4..6u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        updates.insert(nonce_update(Address::repeat_byte(45)));
-        let generator = updates
-            .fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-
-        let mut updates = MptUpdates::default();
-        let mut update = nonce_update(Address::repeat_byte(45));
-        update.old_value = Word::one();
-        update.new_value = Word::from(213);
-        updates.insert(update);
-
-        updates.fill_state_roots_from_generator(generator);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn nonexisting_type_1() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 4..6u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        // The key of this address has the same first byte as the key of Address::zero();
-        let mut address = Address::zero();
-        address.0[1] = 202;
-
-        updates.insert(MptUpdate {
-            key: Key::Account {
-                address,
-                field_tag: AccountFieldTag::NonExisting,
-            },
-            ..Default::default()
-        });
-
-        updates.fill_state_roots(&ZktrieState::default());
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn nonce_update_type_1() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 4..6u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        updates.insert(nonce_update(Address::zero()));
-
-        // The key of this address has the same first byte as the key of Address::zero();
-        let mut address = Address::zero();
-        address.0[1] = 202;
-        updates.insert(nonce_update(address));
-
-        updates.fill_state_roots(&ZktrieState::default());
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn nonce_update_type_2() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        updates.insert(nonce_update(Address::zero()));
-
-        // The key of this address has the same first byte as the key of Address::zero();
-        let mut address = Address::zero();
-        address.0[1] = 202;
-        updates.insert(nonce_update(address));
-
-        // This address is type 2 empty in the MPT containing the above two addresses.
-        updates.insert(nonce_update(Address::repeat_byte(0x45)));
-
-        updates.fill_state_roots(&ZktrieState::default());
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    fn balance_update(address: Address) -> MptUpdate {
-        MptUpdate {
-            key: Key::Account {
-                address,
-                field_tag: AccountFieldTag::Balance,
-            },
-            new_value: Word::from(u64::MAX),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn balance_update_existing() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 4..6u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        updates.insert(balance_update(Address::repeat_byte(45)));
-        let generator = updates
-            .fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-
-        let mut updates = MptUpdates::default();
-        let mut update = balance_update(Address::repeat_byte(45));
-        update.old_value = Word::from(u64::MAX);
-        update.new_value = Word::from(u64::MAX - (1 << 50));
-        updates.insert(update);
-
-        updates.fill_state_roots_from_generator(generator);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn balance_update_type_1() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 4..6u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        updates.insert(nonce_update(Address::zero()));
-
-        // The key of this address has the same first byte as the key of Address::zero();
-        let mut address = Address::zero();
-        address.0[1] = 202;
-        updates.insert(balance_update(address));
-
-        updates.fill_state_roots(&ZktrieState::default());
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn balance_update_type_2() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        updates.insert(nonce_update(Address::zero()));
-
-        // The key of this address has the same first byte as the key of Address::zero();
-        let mut address = Address::zero();
-        address.0[1] = 202;
-        updates.insert(nonce_update(address));
-
-        // This address is type 2 empty in the MPT containing the above two addresses.
-        updates.insert(balance_update(Address::repeat_byte(0x45)));
-
-        updates.fill_state_roots(&ZktrieState::default());
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn update_code_size_existing() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 4..6u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::repeat_byte(45);
-        updates.insert(nonce_update(address));
-
-        let generator = updates
-            .fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-
-        let mut updates = MptUpdates::default();
-        let update = MptUpdate {
-            key: Key::Account {
-                address,
-                field_tag: AccountFieldTag::CodeSize,
-            },
-            new_value: Word::from(23412341231u64),
-            ..Default::default()
-        };
-        updates.insert(update);
-
-        updates.fill_state_roots_from_generator(generator);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn update_code_hash_existing() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 4..6u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::repeat_byte(45);
-        updates.insert(nonce_update(address));
-
-        let generator = updates
-            .fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-
-        let mut updates = MptUpdates::default();
-        let update = MptUpdate {
-            key: Key::Account {
-                address,
-                field_tag: AccountFieldTag::CodeHash,
-            },
-            new_value: Word::from(234123124231231u64),
-            ..Default::default()
-        };
-        updates.insert(update);
-
-        updates.fill_state_roots_from_generator(generator);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn update_keccak_code_hash_existing() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 4..6u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::repeat_byte(45);
-        updates.insert(nonce_update(address));
-
-        let generator = updates
-            .fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-
-        let mut updates = MptUpdates::default();
-        let update = MptUpdate {
-            key: Key::Account {
-                address,
-                field_tag: AccountFieldTag::KeccakCodeHash,
-            },
-            new_value: U256([u64::MAX; 4]),
-            ..Default::default()
-        };
-        updates.insert(update);
-
-        updates.fill_state_roots_from_generator(generator);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    // Every (existing, type 1, type 2) x (existing, type 1, type 2) combination is possible
-    // except for type 1 -> type 2 and type 2 -> type 1
-    #[test]
-    fn update_storage_existing_to_existing() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..20u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        for i in 0..100 {
-            updates.insert(MptUpdate {
-                key: Key::AccountStorage {
-                    address,
-                    tx_id: 0,
-                    exists: false, // true causes an unwraprror?  nope....
-                    storage_key: Word::from(i),
-                },
-                new_value: Word::from(u32::MAX),
-                ..Default::default()
-            });
-        }
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::from(2431230),
-            },
-            new_value: Word::from(u32::MAX),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 11,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::from(2431230),
-            },
-            old_value: Word::from(u32::MAX),
-            new_value: Word::MAX - Word::from(u64::MAX),
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn update_storage_type_1_to_type_1() {
-        assert!(*HASH_SCHEME_DONE);
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::from(2431230),
-            },
-            new_value: Word::from(u32::MAX),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 11,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::from(2431230),
-            },
-            old_value: Word::from(u32::MAX),
-            new_value: Word::from(24),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::from(2431230),
-            },
-            new_value: Word::from(u32::MAX),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 11,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::from(2431230),
-            },
-            old_value: Word::from(u32::MAX),
-            new_value: Word::from(24),
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn update_storage_type_2_to_type_2() {
-        assert!(*HASH_SCHEME_DONE);
-    }
-
-    #[test]
-    fn update_storage_type_1_to_existing() {
-        assert!(*HASH_SCHEME_DONE);
-    }
-
-    #[test]
-    fn update_storage_type_2_to_existing() {
-        assert!(*HASH_SCHEME_DONE);
-    }
-
-    #[test]
-    fn update_storage_existing_to_type_1() {
-        assert!(*HASH_SCHEME_DONE);
-    }
-
-    #[test]
-    fn update_storage_existing_to_type_2() {
-        assert!(*HASH_SCHEME_DONE);
-    }
-
-    #[test]
-    fn read_storage_type_1() {
-        assert!(*HASH_SCHEME_DONE);
-    }
-
-    #[test]
-    fn read_storage_type_2() {
-        assert!(*HASH_SCHEME_DONE);
-    }
-
-    #[test]
-    fn read_empty_storage_trie() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        let update = MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::from(u64::MAX),
-            },
-            ..Default::default()
-        };
-        updates.insert(update);
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn write_empty_storage_trie() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        let update = MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::MAX,
-            },
-            new_value: Word::from(u32::MAX),
-            ..Default::default()
-        };
-        updates.insert(update);
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn read_singleton_storage_trie() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::MAX - Word::from(43),
-            },
-            new_value: Word::from(u32::MAX),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::MAX,
-            },
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn write_singleton_storage_trie() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::MAX - Word::from(43),
-            },
-            new_value: Word::from(u32::MAX),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false, // true causes an unwraprror?  nope....
-                storage_key: Word::MAX,
-            },
-            new_value: Word::one(),
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn write_zero_to_singleton_storage_trie() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false,
-                storage_key: Word::MAX - Word::from(43),
-            },
-            new_value: Word::from(u32::MAX),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: true,
-                storage_key: Word::MAX - Word::from(43),
-            },
-            old_value: Word::from(u32::MAX),
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn write_zero_to_doubleton_storage_trie() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false,
-                storage_key: Word::MAX - Word::from(43),
-            },
-            new_value: Word::MAX - Word::from(43),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false,
-                storage_key: Word::MAX - Word::from(12312),
-            },
-            new_value: Word::from(u64::MAX),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: true,
-                storage_key: Word::MAX - Word::from(43),
-            },
-            old_value: Word::MAX - Word::from(43),
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn write_zero_to_storage_trie() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        for i in 0..100u64 {
-            updates.insert(MptUpdate {
-                key: Key::AccountStorage {
-                    address,
-                    tx_id: 10,
-                    exists: false, // true causes an unwraprror?  nope....
-                    storage_key: Word::from(1000 * i),
-                },
-                new_value: Word::from(u32::MAX),
-                ..Default::default()
-            });
-        }
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 11,
-                exists: true,
-                storage_key: Word::from(2000),
-            },
-            old_value: Word::from(u32::MAX),
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn empty_storage_proof_empty_trie() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 11,
-                exists: false,
-                storage_key: Word::from(2000),
-            },
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn empty_storage_proof_singleton_trie() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 10,
-                exists: false,
-                storage_key: Word::from(1000),
-            },
-            new_value: Word::one(),
-            ..Default::default()
-        });
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 11,
-                exists: false,
-                storage_key: Word::from(2000),
-            },
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[test]
-    fn empty_storage_proof_type_1() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 0..1u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(nonce_update(address));
-        }
-
-        let address = Address::zero();
-        for i in 0..100u64 {
-            updates.insert(MptUpdate {
-                key: Key::AccountStorage {
-                    address,
-                    tx_id: 10,
-                    exists: false, // true causes an unwraprror?  nope....
-                    storage_key: Word::from(1000 * i),
-                },
-                new_value: Word::from(u32::MAX),
-                ..Default::default()
-            });
-        }
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 11,
-                exists: false,
-                storage_key: Word::from(3),
-            },
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[ignore = "TODO(mason): is it valid to put these storage writes on empty acc?"]
-    #[test]
-    fn empty_account_empty_storage_proof() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 1..20u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(MptUpdate {
-                key: Key::AccountStorage {
-                    address,
-                    tx_id: 10,
-                    exists: false,
-                    storage_key: Word::from(3),
-                },
-                new_value: Word::one(),
-                ..Default::default()
-            });
-        }
-
-        let address = Address::zero();
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 11,
-                exists: false,
-                storage_key: Word::from(3),
-            },
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
-    }
-
-    #[ignore = "TODO(mason): is it valid to put these storage writes on empty acc?"]
-    #[test]
-    fn empty_account_storage_write() {
-        assert!(*HASH_SCHEME_DONE);
-
-        let mut updates = MptUpdates::default();
-        // Add precompile addresses in so MPT isn't too empty.
-        for precompile in 1..20u8 {
-            let mut address = Address::zero();
-            address.0[1] = precompile;
-            updates.insert(MptUpdate {
-                key: Key::AccountStorage {
-                    address,
-                    tx_id: 10,
-                    exists: false,
-                    storage_key: Word::from(3),
-                },
-                new_value: Word::one(),
-                ..Default::default()
-            });
-        }
-
-        let address = Address::zero();
-        updates.insert(MptUpdate {
-            key: Key::AccountStorage {
-                address,
-                tx_id: 11,
-                exists: false,
-                storage_key: Word::from(3),
-            },
-            new_value: Word::one(),
-            ..Default::default()
-        });
-
-        updates.fill_state_roots_from_generator(WitnessGenerator::from(&ZktrieState::default()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&updates.smt_traces.last().unwrap()).unwrap()
-        );
     }
 }

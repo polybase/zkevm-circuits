@@ -11,11 +11,12 @@ pub use dev::ExpCircuit as TestExpCircuit;
 use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
     table::{ExpTable, LookupTable, U16Table},
-    util::{Challenges, SubCircuit, SubCircuitConfig},
+    util::{Challenges, Field, SubCircuit, SubCircuitConfig},
     witness,
 };
 use bus_mapping::circuit_input_builder::{ExpEvent, ExpStep};
-use eth_types::{Field, ToScalar, U256};
+use eth_types::U256;
+use gadgets::ToScalar;
 use gadgets::{
     mul_add::{MulAddChip, MulAddConfig},
     util::{and, not, Expr},
@@ -537,7 +538,7 @@ impl<F: Field> ExpCircuit<F> {
         Self {
             exp_events,
             max_exp_rows,
-            _marker: PhantomData::default(),
+            _marker: PhantomData,
         }
     }
 }
@@ -568,7 +569,7 @@ impl<F: Field> SubCircuit<F> for ExpCircuit<F> {
         11
     }
 
-    fn new_from_block(block: &witness::Block<F>) -> Self {
+    fn new_from_block(block: &witness::Block) -> Self {
         // Hardcoded to pass unit tests for now. In the future, insert:
         // "block.circuits_params.max_exp_rows"
         Self::new(
@@ -578,7 +579,7 @@ impl<F: Field> SubCircuit<F> for ExpCircuit<F> {
     }
 
     /// Return the minimum number of rows required to prove the block
-    fn min_num_rows_block(block: &witness::Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &witness::Block) -> (usize, usize) {
         (
             Self::Config::min_num_rows(&block.exp_events),
             block.circuits_params.max_exp_steps,

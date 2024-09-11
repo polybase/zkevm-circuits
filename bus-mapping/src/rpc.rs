@@ -9,9 +9,10 @@ use eth_types::{
 pub use ethers_core::types::BlockNumber;
 use ethers_providers::JsonRpcClient;
 use serde::Serialize;
+use serde_json::json;
 use std::collections::HashMap;
 
-use crate::util::CHECK_MEM_STRICT;
+use crate::util::GETH_TRACE_CHECK_LEVEL;
 
 /// Serialize a type.
 ///
@@ -22,12 +23,28 @@ pub fn serialize<T: serde::Serialize>(t: &T) -> serde_json::Value {
     serde_json::to_value(t).expect("Types never fail to serialize.")
 }
 
+fn merge_json_object(a: &mut serde_json::Value, b: serde_json::Value) {
+    if let serde_json::Value::Object(a) = a {
+        if let serde_json::Value::Object(b) = b {
+            for (k, v) in b {
+                merge_json_object(a.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+            return;
+        }
+    }
+    *a = b;
+}
+
 #[derive(Serialize)]
 #[doc(hidden)]
 pub(crate) struct GethLoggerConfig {
     /// enable memory capture
     #[serde(rename = "EnableMemory")]
     enable_memory: bool,
+    /// disable memory capture, Erigo client
+    /// use this flag rather than 'enable'
+    #[serde(rename = "DisableMemory")]
+    disable_memory: bool,
     /// disable stack capture
     #[serde(rename = "DisableStack")]
     disable_stack: bool,
@@ -37,15 +54,23 @@ pub(crate) struct GethLoggerConfig {
     /// enable return data capture
     #[serde(rename = "EnableReturnData")]
     enable_return_data: bool,
+    /// enable return data capture
+    #[serde(rename = "timeout")]
+    timeout: Option<String>,
 }
 
 impl Default for GethLoggerConfig {
     fn default() -> Self {
         Self {
-            enable_memory: false,
-            disable_stack: false,
-            disable_storage: false,
+            enable_memory: cfg!(feature = "enable-memory") || GETH_TRACE_CHECK_LEVEL.should_check(),
+            disable_memory: !(cfg!(feature = "enable-memory")
+                || GETH_TRACE_CHECK_LEVEL.should_check()),
+            disable_stack: !(cfg!(feature = "enable-stack")
+                || GETH_TRACE_CHECK_LEVEL.should_check()),
+            disable_storage: !(cfg!(feature = "enable-storage")
+                || GETH_TRACE_CHECK_LEVEL.should_check()),
             enable_return_data: true,
+            timeout: None,
         }
     }
 }
@@ -120,7 +145,10 @@ impl<P: JsonRpcClient> GethClient<P> {
     /// transaction of the block.
     pub async fn trace_block_by_hash(&self, hash: Hash) -> Result<Vec<GethExecTrace>, Error> {
         let hash = serialize(&hash);
-        let cfg = serialize(&GethLoggerConfig::default());
+        let cfg = serialize(&GethLoggerConfig {
+            timeout: Some("300s".to_string()),
+            ..Default::default()
+        });
         let resp: ResultGethExecTraces = self
             .0
             .request("debug_traceBlockByHash", [hash, cfg])
@@ -137,28 +165,136 @@ impl<P: JsonRpcClient> GethClient<P> {
         block_num: BlockNumber,
     ) -> Result<Vec<GethExecTrace>, Error> {
         let num = serialize(&block_num);
-        let cfg = serialize(&GethLoggerConfig::default());
-        let resp: ResultGethExecTraces = self
+        let cfg = serialize(&GethLoggerConfig {
+            timeout: Some("300s".to_string()),
+            ..Default::default()
+        });
+        let mut struct_logs: Vec<serde_json::Value> = self
             .0
-            .request("debug_traceBlockByNumber", [num, cfg])
+            .request("debug_traceBlockByNumber", [num.clone(), cfg])
             .await
             .map_err(|e| Error::JSONRpcError(e.into()))?;
+        let mux_trace: Vec<serde_json::Value> = self
+            .0
+            .request(
+                "debug_traceBlockByNumber",
+                [
+                    num,
+                    json!({
+                        "tracer": "muxTracer",
+                        "tracerConfig": {
+                            "callTracer": {},
+                            "prestateTracer": {}
+                        }
+                    }),
+                ],
+            )
+            .await
+            .map_err(|e| Error::JSONRpcError(e.into()))?;
+
+        for (struct_log, mux) in struct_logs.iter_mut().zip(mux_trace.into_iter()) {
+            merge_json_object(
+                struct_log,
+                json!({
+                    "result": {
+                        "prestate": mux["result"]["prestateTracer"],
+                        "callTrace": mux["result"]["callTracer"],
+                    }
+                }),
+            );
+        }
+
+        let resp: ResultGethExecTraces =
+            serde_json::from_value(serde_json::Value::Array(struct_logs))
+                .map_err(|e| Error::JSONRpcError(e.into()))?;
+
         Ok(resp.0.into_iter().map(|step| step.result).collect())
     }
-    /// ..
-    pub async fn trace_tx_by_hash(&self, hash: H256) -> Result<Vec<GethExecTrace>, Error> {
+
+    /// ...
+    pub async fn trace_tx_by_hash_legacy(&self, hash: H256) -> Result<GethExecTrace, Error> {
         let hash = serialize(&hash);
         let cfg = GethLoggerConfig {
-            enable_memory: *CHECK_MEM_STRICT,
+            timeout: Some("60s".to_string()),
             ..Default::default()
         };
         let cfg = serialize(&cfg);
-        let resp: GethExecTrace = self
+        let mut struct_logs: serde_json::Value = self
             .0
-            .request("debug_traceTransaction", [hash, cfg])
+            .request("debug_traceTransaction", [hash.clone(), cfg])
             .await
             .map_err(|e| Error::JSONRpcError(e.into()))?;
-        Ok(vec![resp])
+
+        let cfg = serialize(&serde_json::json! ({
+            "tracer": "prestateTracer",
+            "timeout": "60s",
+        }));
+        let prestate: serde_json::Value = self
+            .0
+            .request("debug_traceTransaction", [hash.clone(), cfg])
+            .await
+            .map_err(|e| Error::JSONRpcError(e.into()))?;
+        let cfg = serialize(&serde_json::json! ({
+            "tracer": "callTracer",
+            "timeout": "60s",
+        }));
+        let calls: serde_json::Value = self
+            .0
+            .request("debug_traceTransaction", [hash.clone(), cfg])
+            .await
+            .map_err(|e| Error::JSONRpcError(e.into()))?;
+        merge_json_object(
+            &mut struct_logs,
+            json!({
+                "prestate": prestate,
+                "callTrace": calls,
+            }),
+        );
+        let resp =
+            serde_json::from_value(struct_logs).map_err(|e| Error::JSONRpcError(e.into()))?;
+        Ok(resp)
+    }
+
+    /// ..
+    pub async fn trace_tx_by_hash(&self, hash: H256) -> Result<GethExecTrace, Error> {
+        let hash = serialize(&hash);
+        let cfg = GethLoggerConfig {
+            timeout: Some("60s".to_string()),
+            ..Default::default()
+        };
+        let cfg = serialize(&cfg);
+        let mut struct_logs: serde_json::Value = self
+            .0
+            .request("debug_traceTransaction", [hash.clone(), cfg])
+            .await
+            .map_err(|e| Error::JSONRpcError(e.into()))?;
+        let mux_trace: serde_json::Value = self
+            .0
+            .request(
+                "debug_traceTransaction",
+                [
+                    hash,
+                    json!({
+                        "tracer": "muxTracer",
+                        "tracerConfig": {
+                            "callTracer": {},
+                            "prestateTracer": {}
+                        }
+                    }),
+                ],
+            )
+            .await
+            .map_err(|e| Error::JSONRpcError(e.into()))?;
+        merge_json_object(
+            &mut struct_logs,
+            json!({
+                "prestate": mux_trace["prestateTracer"],
+                "callTrace": mux_trace["callTracer"],
+            }),
+        );
+        let resp =
+            serde_json::from_value(struct_logs).map_err(|e| Error::JSONRpcError(e.into()))?;
+        Ok(resp)
     }
 
     /// Call `debug_traceBlockByHash` use prestateTracer to get prestate
@@ -169,6 +305,7 @@ impl<P: JsonRpcClient> GethClient<P> {
         let hash = serialize(&hash);
         let cfg = serialize(&serde_json::json! ({
             "tracer": "prestateTracer",
+            "timeout": "300s",
         }));
         let resp: ResultGethPrestateTraces = self
             .0
@@ -176,6 +313,23 @@ impl<P: JsonRpcClient> GethClient<P> {
             .await
             .map_err(|e| Error::JSONRpcError(e.into()))?;
         Ok(resp.0.into_iter().map(|step| step.result).collect())
+    }
+
+    /// Call `debug_traceTransaction` use prestateTracer to get prestate
+    pub async fn trace_tx_prestate_by_hash(
+        &self,
+        hash: H256,
+    ) -> Result<HashMap<Address, GethPrestateTrace>, Error> {
+        let hash = serialize(&hash);
+        let cfg = serialize(&serde_json::json! ({
+            "tracer": "prestateTracer",
+        }));
+        let resp: HashMap<Address, GethPrestateTrace> = self
+            .0
+            .request("debug_traceTransaction", [hash, cfg])
+            .await
+            .map_err(|e| Error::JSONRpcError(e.into()))?;
+        Ok(resp)
     }
 
     /// Calls `eth_getCode` via JSON-RPC returning a contract code

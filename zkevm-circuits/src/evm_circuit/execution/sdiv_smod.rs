@@ -13,10 +13,10 @@ use crate::{
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{Expr, Field},
 };
 use bus_mapping::evm::OpcodeId;
-use eth_types::{Field, ToLittleEndian, U256};
+use eth_types::{ToLittleEndian, U256};
 use halo2_proofs::plonk::Error;
 
 #[derive(Clone, Debug)]
@@ -144,12 +144,13 @@ impl<F: Field> ExecutionGadget<F> for SignedDivModGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
         let indices = [step.rw_indices[0], step.rw_indices[1], step.rw_indices[2]];
         let [pop1, pop2, push] = indices.map(|idx| block.rws[idx].stack_value());
         let pop1_abs = get_abs(pop1);
@@ -272,8 +273,8 @@ mod test {
         test_ok(OpcodeId::SDIV, 0xABC.into(), 0.into());
         // (1 << 255) + (7 << 128)
         let mut x = [0u8; 32];
-        x[31] = 128u8;
-        x[16] = 7u8;
+        x[0] = 128u8;
+        x[15] = 7u8;
         test_ok(OpcodeId::SDIV, Word::from_big_endian(&x), 0x1234.into());
         test_ok(
             OpcodeId::SDIV,
@@ -287,7 +288,7 @@ mod test {
         );
         // 1 << 255
         let mut x = [0u8; 32];
-        x[31] = 128u8;
+        x[0] = 128u8;
         test_ok(
             OpcodeId::SDIV,
             Word::from_big_endian(&x),
@@ -310,8 +311,8 @@ mod test {
         test_ok(OpcodeId::SMOD, 0xABC.into(), 0.into());
         // (1 << 255) + (7 << 128)
         let mut x = [0u8; 32];
-        x[31] = 128u8;
-        x[16] = 7u8;
+        x[0] = 128u8;
+        x[15] = 7u8;
         test_ok(OpcodeId::SMOD, Word::from_big_endian(&x), 0x1234.into());
         test_ok(
             OpcodeId::SMOD,
@@ -324,7 +325,7 @@ mod test {
             Word::from_big_endian(&[255u8; 32]),
         );
         let mut x = [0u8; 32];
-        x[31] = 128u8;
+        x[0] = 128u8;
         test_ok(
             OpcodeId::SMOD,
             Word::from_big_endian(&x),

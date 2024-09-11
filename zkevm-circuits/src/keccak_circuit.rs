@@ -34,10 +34,9 @@ use crate::{
         split, split_uniform, transform, transform_to, Part,
     },
     table::{KeccakTable, LookupTable},
-    util::{Challenges, SubCircuit, SubCircuitConfig},
-    witness,
+    util::{Challenges, Field, SubCircuit, SubCircuitConfig},
+    witness::{self, keccak::keccak_inputs},
 };
-use eth_types::Field;
 use gadgets::util::{and, not, select, sum, Expr};
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Region, Value},
@@ -297,7 +296,7 @@ impl<F: Field> SubCircuitConfig<F> for KeccakCircuitConfig<F> {
         // that allows reusing the same parts in an optimal way for the chi step.
         // We can save quite a few columns by not recombining the parts after rho/pi and
         // re-splitting the words again before chi. Instead we do chi directly
-        // on the output parts of rho/pi. For rho/pi specically we do
+        // on the output parts of rho/pi. For rho/pi specifically we do
         // `s[j][2 * i + 3 * j) % 5] = normalize(rot(s[i][j], RHOM[i][j]))`.
         cell_manager.start_region();
         let mut lookup_counter = 0;
@@ -1017,25 +1016,25 @@ impl<F: Field> SubCircuit<F> for KeccakCircuit<F> {
     /// The `block.circuits_params.keccak_padding` parameter, when enabled, sets
     /// up the circuit to support a fixed number of permutations/keccak_f's,
     /// independently of the permutations required by `inputs`.
-    fn new_from_block(block: &witness::Block<F>) -> Self {
+    fn new_from_block(block: &witness::Block) -> Self {
         Self::new(
             block.circuits_params.max_keccak_rows,
-            block.keccak_inputs.clone(),
+            keccak_inputs(block).unwrap(),
         )
     }
 
     /// Return the minimum number of rows required to prove the block
-    fn min_num_rows_block(block: &witness::Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &witness::Block) -> (usize, usize) {
         let rows_per_chunk = (NUM_ROUNDS + 1) * get_num_rows_per_round();
-        let aux_tables_rows = vec![
+        let aux_tables_rows = [
             normalize_table_size(6),
             normalize_table_size(4),
             normalize_table_size(3),
             lookup_table_size(CHI_BASE_LOOKUP_TABLE.len()),
         ];
         (
-            block
-                .keccak_inputs
+            keccak_inputs(block)
+                .unwrap()
                 .iter()
                 .map(|bytes| (bytes.len() as f64 / 136.0).ceil() as usize * rows_per_chunk)
                 .sum::<usize>()

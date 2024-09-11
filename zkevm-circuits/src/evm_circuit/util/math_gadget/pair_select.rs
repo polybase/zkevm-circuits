@@ -3,9 +3,8 @@ use crate::{
         constraint_builder::{ConstrainBuilderCommon, EVMConstraintBuilder},
         CachedRegion, Cell,
     },
-    util::Expr,
+    util::{Expr, Field},
 };
-use eth_types::Field;
 use halo2_proofs::{
     circuit::Value,
     plonk::{Error, Expression},
@@ -65,7 +64,9 @@ mod tests {
     use crate::evm_circuit::util::constraint_builder::ConstrainBuilderCommon;
 
     use super::{super::test_util::*, *};
+    use crate::util::Field;
     use eth_types::*;
+    use gadgets::ToScalar;
     use halo2_proofs::{halo2curves::bn256::Fr, plonk::Error};
 
     #[derive(Clone)]
@@ -99,9 +100,9 @@ mod tests {
 
             PairSelectionTestContainer {
                 select_gadget,
-                v,
                 a,
                 b,
+                v,
             }
         }
 
@@ -128,12 +129,12 @@ mod tests {
     fn test_pairselect_eq() {
         try_test!(
             PairSelectionTestContainer<Fr, true>,
-            vec![Word::from(0), Word::from(0), Word::from(0)],
+            [Word::from(0), Word::from(0), Word::from(0)],
             true,
         );
         try_test!(
             PairSelectionTestContainer<Fr, true>,
-            vec![Word::from(2898), Word::from(2898), Word::from(2898)],
+            [Word::from(2898), Word::from(2898), Word::from(2898)],
             true,
         );
     }
@@ -142,17 +143,17 @@ mod tests {
     fn test_pairselect_expect_a_and_a() {
         try_test!(
             PairSelectionTestContainer<Fr, true>,
-            vec![Word::from(0), Word::from(0), Word::from(1)],
+            [Word::from(0), Word::from(0), Word::from(1)],
             true,
         );
         try_test!(
             PairSelectionTestContainer<Fr, true>,
-            vec![Word::from(2898), Word::from(2898), Word::from(1)],
+            [Word::from(2898), Word::from(2898), Word::from(1)],
             true,
         );
         try_test!(
             PairSelectionTestContainer<Fr, true>,
-            vec![WORD_LOW_MAX, WORD_LOW_MAX, Word::from(1)],
+            [WORD_LOW_MAX, WORD_LOW_MAX, Word::from(1)],
             true,
         );
     }
@@ -161,12 +162,12 @@ mod tests {
     fn test_pairselect_expect_a_but_b() {
         try_test!(
             PairSelectionTestContainer<Fr, true>,
-            vec![Word::from(0), Word::from(1), Word::from(0)],
+            [Word::from(0), Word::from(1), Word::from(0)],
             false,
         );
         try_test!(
             PairSelectionTestContainer<Fr, true>,
-            vec![Word::from(2989), Word::from(1), Word::from(2989)],
+            [Word::from(2989), Word::from(1), Word::from(2989)],
             false,
         );
     }
@@ -175,12 +176,12 @@ mod tests {
     fn test_pairselect_expect_b_and_b() {
         try_test!(
             PairSelectionTestContainer<Fr, false>,
-            vec![Word::from(0), Word::from(1), Word::from(0)],
+            [Word::from(0), Word::from(1), Word::from(0)],
             true,
         );
         try_test!(
             PairSelectionTestContainer<Fr, false>,
-            vec![Word::from(2989), Word::from(1), Word::from(2989)],
+            [Word::from(2989), Word::from(1), Word::from(2989)],
             true,
         );
     }

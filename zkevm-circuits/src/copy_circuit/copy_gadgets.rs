@@ -1,6 +1,6 @@
 use super::{CURRENT, NEXT_ROW, NEXT_STEP};
+use crate::util::Field;
 use bus_mapping::circuit_input_builder::CopyDataType;
-use eth_types::Field;
 use gadgets::{
     binary_number::BinaryNumberConfig,
     is_equal::IsEqualConfig,
@@ -19,6 +19,8 @@ pub fn constrain_tag<F: Field>(
     is_bytecode: Column<Advice>,
     is_memory: Column<Advice>,
     is_tx_log: Column<Advice>,
+    is_access_list_address: Column<Advice>,
+    is_access_list_storage_key: Column<Advice>,
 ) {
     meta.create_gate("decode tag", |meta| {
         let enabled = meta.query_fixed(q_enable, CURRENT);
@@ -26,6 +28,8 @@ pub fn constrain_tag<F: Field>(
         let is_bytecode = meta.query_advice(is_bytecode, CURRENT);
         let is_memory = meta.query_advice(is_memory, CURRENT);
         let is_tx_log = meta.query_advice(is_tx_log, CURRENT);
+        let is_access_list_address = meta.query_advice(is_access_list_address, CURRENT);
+        let is_access_list_storage_key = meta.query_advice(is_access_list_storage_key, CURRENT);
         vec![
             // Match boolean indicators to their respective tag values.
             enabled.expr()
@@ -34,6 +38,12 @@ pub fn constrain_tag<F: Field>(
                 * (is_bytecode - tag.value_equals(CopyDataType::Bytecode, CURRENT)(meta)),
             enabled.expr() * (is_memory - tag.value_equals(CopyDataType::Memory, CURRENT)(meta)),
             enabled.expr() * (is_tx_log - tag.value_equals(CopyDataType::TxLog, CURRENT)(meta)),
+            enabled.expr()
+                * (is_access_list_address
+                    - tag.value_equals(CopyDataType::AccessListAddresses, CURRENT)(meta)),
+            enabled.expr()
+                * (is_access_list_storage_key
+                    - tag.value_equals(CopyDataType::AccessListStorageKeys, CURRENT)(meta)),
         ]
     });
 }
@@ -484,27 +494,69 @@ pub fn constrain_address<F: Field>(
 pub fn constrain_rw_counter<F: Field>(
     cb: &mut BaseConstraintBuilder<F>,
     meta: &mut VirtualCells<'_, F>,
-    is_last: Expression<F>,      // The last row.
-    is_last_step: Expression<F>, // Both the last reader and writer rows.
+    is_last_col: Column<Advice>,
+    is_first: Expression<F>,
     is_rw_type: Expression<F>,
-    is_word_end: Expression<F>,
+    is_row_end: Expression<F>,
+    is_memory_copy: Expression<F>,
     rw_counter: Column<Advice>,
     rwc_inc_left: Column<Advice>,
 ) {
     // Decrement rwc_inc_left for the next row, when an RW operation happens.
-    let rwc_diff = is_rw_type.expr() * is_word_end.expr();
-    let new_value = meta.query_advice(rwc_inc_left, CURRENT) - rwc_diff;
+    let rwc_diff = is_rw_type.expr() * is_row_end.expr();
+    let cur_rwc_inc_left = meta.query_advice(rwc_inc_left, CURRENT);
+    let new_value = cur_rwc_inc_left.clone() - rwc_diff;
+
+    let is_last = meta.query_advice(is_last_col, CURRENT);
+    let is_last_two = meta.query_advice(is_last_col, NEXT_ROW);
+
     // At the end, it must reach 0.
     let update_or_finish = select::expr(
-        not::expr(is_last.expr()),
+        not::expr(is_last.clone()),
         meta.query_advice(rwc_inc_left, NEXT_ROW),
         0.expr(),
     );
-    cb.require_equal(
-        "rwc_inc_left[2] == rwc_inc_left[0] - rwc_diff, or 0 at the end",
-        new_value,
-        update_or_finish,
+
+    let update_or_finish_mcopy = meta.query_advice(rwc_inc_left, NEXT_STEP);
+    cb.condition(not::expr(is_memory_copy.clone()), |cb| {
+        cb.require_equal(
+            "rwc_inc_left[1] == rwc_inc_left[0] - rwc_diff, or 0 at the end",
+            new_value.clone(),
+            update_or_finish,
+        );
+    });
+
+    // handle is_memory_copy case: for all read steps, `rwc_inc_left` decrease by 1 or 0,
+    // for all write steps, `rwc_inc_left` decrease by 1 or 0 as well. this is not the same as
+    // normal case( `rwc_inc_left` decrease by 1 or 0 for consecutive read steps--> write step
+    // --> read step -->write step ...).
+    cb.condition(
+        is_memory_copy.clone() * not::expr(is_last_two.clone()) * not::expr(is_last.clone()),
+        |cb| {
+            cb.require_equal(
+                "rwc_inc_left[2] == rwc_inc_left[0] - rwc_diff, or 0 at the end",
+                new_value,
+                update_or_finish_mcopy,
+            );
+        },
     );
+
+    // the last row is write row.
+    cb.condition(is_memory_copy.clone() * is_last.clone(), |cb| {
+        cb.require_equal(
+            "constrain last rwc_inc_left == 1 ",
+            cur_rwc_inc_left,
+            1.expr(),
+        );
+    });
+    // second(write) step's rwc_inc_left is half of the first.
+    cb.condition(is_memory_copy * is_first, |cb| {
+        cb.require_equal(
+            "rwc_inc_left[0] ==  2 * rwc_inc_left[1] ",
+            meta.query_advice(rwc_inc_left, CURRENT),
+            2.expr() * meta.query_advice(rwc_inc_left, NEXT_ROW),
+        );
+    });
 
     // Maintain rw_counter based on rwc_inc_left. Their sum remains constant in all cases.
     cb.condition(not::expr(is_last.expr()), |cb| {
@@ -514,14 +566,74 @@ pub fn constrain_rw_counter<F: Field>(
             meta.query_advice(rw_counter, NEXT_ROW) + meta.query_advice(rwc_inc_left, NEXT_ROW),
         );
     });
+}
 
-    // Ensure that the word operation completes.
+/// validate `is_memory_copy` column is set correctly .
+pub fn constrain_is_memory_copy<F: Field>(
+    cb: &mut BaseConstraintBuilder<F>,
+    meta: &mut VirtualCells<'_, F>,
+    is_last_col: Column<Advice>,
+    is_id_unchange: &IsEqualConfig<F>,
+    is_memory: Column<Advice>,
+    is_memory_copy: Expression<F>,
+) {
+    let is_memory_cur = meta.query_advice(is_memory, CURRENT);
+    let is_memory_next = meta.query_advice(is_memory, NEXT_ROW);
+    let is_last = meta.query_advice(is_last_col, CURRENT);
+
+    // at any case, `is_memory_copy` is bool type.
+    cb.require_boolean("is_memory_copy is always bool", is_memory_copy.clone());
+    cb.condition(not::expr(is_last.clone()), |cb| {
+        cb.require_equal(
+            "is_memory_copy == is_memory_cur * is_memory_next * is_id_unchange",
+            is_memory_copy.clone(),
+            is_memory_cur * is_memory_next * is_id_unchange.expr(),
+        );
+    });
+}
+
+/// Ensure the word operation completes for RW.
+pub fn constrain_rw_word_complete<F: Field>(
+    cb: &mut BaseConstraintBuilder<F>,
+    is_last_step: Expression<F>, // Both the last reader and writer rows.
+    is_rw_word_type: Expression<F>,
+    is_word_end: Expression<F>,
+) {
     cb.require_zero(
         "is_last_step requires is_word_end for word-based types",
         and::expr([
             is_last_step.expr(),
-            is_rw_type.expr(),
+            is_rw_word_type.expr(),
             not::expr(is_word_end.expr()),
         ]),
+    );
+}
+
+/// Ensure the 'is_first_bytecode_table' column is bool and not changed in one copy event.
+pub fn constrain_is_first_bytecode_table<F: Field>(
+    cb: &mut BaseConstraintBuilder<F>,
+    meta: &mut VirtualCells<'_, F>,
+    is_first_bytecode_col: Column<Advice>,
+    is_last_col: Column<Advice>,
+) {
+    let is_first_bytecode_table = meta.query_advice(is_first_bytecode_col, CURRENT);
+    let is_first_bytecode_table_next = meta.query_advice(is_first_bytecode_col, NEXT_ROW);
+
+    cb.require_boolean(
+        "is_first_bytecode_table is bool type",
+        is_first_bytecode_table.clone(),
+    );
+
+    let is_last_step = meta.query_advice(is_last_col, CURRENT);
+    let is_next_last_step = meta.query_advice(is_last_col, NEXT_ROW);
+    cb.condition(
+        not::expr(is_last_step) * not::expr(is_next_last_step),
+        |cb| {
+            cb.require_equal(
+                "is_first_bytecode_table doesn't change in one copy event ",
+                is_first_bytecode_table,
+                is_first_bytecode_table_next,
+            );
+        },
     );
 }

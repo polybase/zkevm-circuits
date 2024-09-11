@@ -7,9 +7,8 @@ use crate::{
             transpose_val_ret, CachedRegion, Cell, CellType,
         },
     },
-    util::Expr,
+    util::{Expr, Field},
 };
-use eth_types::Field;
 use halo2_proofs::{
     circuit::Value,
     plonk::{Error, Expression},
@@ -104,6 +103,7 @@ impl<F: Field, const N_BYTES: usize> ConstantDivisionGadget<F, N_BYTES> {
 #[cfg(test)]
 mod tests {
     use super::{test_util::*, *};
+    use crate::util::Field;
     use eth_types::*;
     use halo2_proofs::{halo2curves::bn256::Fr, plonk::Error};
 
@@ -169,7 +169,7 @@ mod tests {
     fn test_constantdivisiongadget_0div5_rem0() {
         try_test!(
             ConstantDivisionTestContainer<Fr, 4, 5, 0, 0>,
-            vec![Word::from(0)],
+            [Word::from(0)],
             true,
         );
     }
@@ -178,7 +178,7 @@ mod tests {
     fn test_constantdivisiongadget_5div5_rem0() {
         try_test!(
             ConstantDivisionTestContainer<Fr, 4, 5, 1, 0>,
-            vec![Word::from(5)],
+            [Word::from(5)],
             true,
         );
     }
@@ -187,7 +187,7 @@ mod tests {
     fn test_constantdivisiongadget_1div5_rem1() {
         try_test!(
             ConstantDivisionTestContainer<Fr, 4, 5, 0, 1>,
-            vec![Word::from(1)],
+            [Word::from(1)],
             true,
         );
     }
@@ -196,7 +196,7 @@ mod tests {
     fn test_constantdivisiongadget_1div5_rem4() {
         try_test!(
             ConstantDivisionTestContainer<Fr, 4, 5, 1, 4>,
-            vec![Word::from(1)],
+            [Word::from(1)],
             false,
         );
     }
@@ -205,7 +205,7 @@ mod tests {
     fn test_constantdivisiongadget_quotient_overflow() {
         try_test!(
             ConstantDivisionTestContainer<Fr, 4, 5, 4294967296u64, 1>,
-            vec![Word::from(1u64 << (4 * 8)) * 5 + 1],
+            [Word::from(1u64 << (4 * 8)) * 5 + 1],
             false,
         );
     }
@@ -214,7 +214,7 @@ mod tests {
     fn test_constantdivisiongadget_33_div16_rem17() {
         try_test!(
             ConstantDivisionTestContainer<Fr, 4, 16, 1, 17>,
-            vec![Word::from(33)],
+            [Word::from(33)],
             false,
         );
     }

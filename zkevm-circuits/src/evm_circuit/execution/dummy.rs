@@ -7,7 +7,8 @@ use crate::evm_circuit::{
     witness::{Block, Call, ExecStep, Transaction},
 };
 
-use eth_types::{Field, ToLittleEndian};
+use crate::util::Field;
+use eth_types::ToLittleEndian;
 use halo2_proofs::plonk::Error;
 
 #[derive(Clone, Debug)]
@@ -44,7 +45,7 @@ impl<F: Field, const N_POP: usize, const N_PUSH: usize, const S: ExecutionState>
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
         _: &Call,
         step: &ExecStep,

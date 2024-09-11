@@ -1,8 +1,11 @@
-use crate::evm_circuit::util::{
-    self, constraint_builder::EVMConstraintBuilder, from_bytes, math_gadget::*, split_u256,
-    CachedRegion,
+use crate::{
+    evm_circuit::util::{
+        self, constraint_builder::EVMConstraintBuilder, from_bytes, math_gadget::*, split_u256,
+        CachedRegion,
+    },
+    util::Field,
 };
-use eth_types::{Field, Word};
+use eth_types::Word;
 use halo2_proofs::plonk::{Error, Expression};
 
 /// Returns `1` when `lhs < rhs`, and returns `0` otherwise.
@@ -70,6 +73,7 @@ mod tests {
     use crate::evm_circuit::util::constraint_builder::ConstrainBuilderCommon;
 
     use super::{test_util::*, *};
+    use crate::util::Field;
     use eth_types::*;
     use halo2_proofs::{halo2curves::bn256::Fr, plonk::Error};
 
@@ -115,43 +119,35 @@ mod tests {
     fn test_ltword_expect() {
         try_test!(
             LtWordTestContainer<Fr>,
-            vec![Word::from(0), Word::from(1)],
+            [Word::from(0), Word::from(1)],
+            true,
+        );
+        try_test!(LtWordTestContainer<Fr>, [Word::from(1), Word::MAX], true,);
+        try_test!(LtWordTestContainer<Fr>, [WORD_LOW_MAX, WORD_HIGH_MAX], true,);
+        try_test!(
+            LtWordTestContainer<Fr>,
+            [Word::from(90), WORD_LOW_MAX],
             true,
         );
         try_test!(
             LtWordTestContainer<Fr>,
-            vec![Word::from(1), Word::MAX],
-            true,
-        );
-        try_test!(
-            LtWordTestContainer<Fr>,
-            vec![WORD_LOW_MAX, WORD_HIGH_MAX],
-            true,
-        );
-        try_test!(
-            LtWordTestContainer<Fr>,
-            vec![Word::from(90), WORD_LOW_MAX],
-            true,
-        );
-        try_test!(
-            LtWordTestContainer<Fr>,
-            vec![Word::from(90), WORD_HIGH_MAX],
+            [Word::from(90), WORD_HIGH_MAX],
             true,
         );
     }
 
     #[test]
-    fn test_ltword_unexpect() {
+    fn test_ltword_unexpected() {
         try_test!(
             LtWordTestContainer<Fr>,
-            vec![Word::from(1), Word::from(0)],
+            [Word::from(1), Word::from(0)],
             false,
         );
-        try_test!(LtWordTestContainer<Fr>, vec![Word::MAX, Word::MAX], false,);
+        try_test!(LtWordTestContainer<Fr>, [Word::MAX, Word::MAX], false,);
 
         try_test!(
             LtWordTestContainer<Fr>,
-            vec![WORD_HIGH_MAX, WORD_LOW_MAX],
+            [WORD_HIGH_MAX, WORD_LOW_MAX],
             false,
         );
     }

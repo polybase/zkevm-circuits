@@ -11,10 +11,10 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::BlockContextFieldTag,
-    util::Expr,
+    util::{Expr, Field},
 };
 use bus_mapping::evm::OpcodeId;
-use eth_types::{Field, ToLittleEndian};
+use eth_types::ToLittleEndian;
 use halo2_proofs::plonk::Error;
 
 #[derive(Clone, Debug)]
@@ -81,14 +81,14 @@ impl<F: Field> ExecutionGadget<F> for BlockCtxU64Gadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
         self.value_u64
             .same_context
-            .assign_exec_step(region, offset, step)?;
+            .assign_exec_step(region, offset, block, call, step)?;
 
         let value = block.rws[step.rw_indices[0]].stack_value();
 
@@ -122,14 +122,14 @@ impl<F: Field> ExecutionGadget<F> for BlockCtxU160Gadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
         self.value_u160
             .same_context
-            .assign_exec_step(region, offset, step)?;
+            .assign_exec_step(region, offset, block, call, step)?;
 
         let value = block.rws[step.rw_indices[0]].stack_value();
 
@@ -147,13 +147,11 @@ impl<F: Field> ExecutionGadget<F> for BlockCtxU160Gadget<F> {
     }
 }
 
-#[cfg(not(feature = "scroll"))]
 #[derive(Clone, Debug)]
 pub(crate) struct BlockCtxU256Gadget<F> {
     value_u256: BlockCtxGadget<F, N_BYTES_WORD>,
 }
 
-#[cfg(not(feature = "scroll"))]
 impl<F: Field> ExecutionGadget<F> for BlockCtxU256Gadget<F> {
     const NAME: &'static str = "BLOCKCTXU256";
 
@@ -169,14 +167,16 @@ impl<F: Field> ExecutionGadget<F> for BlockCtxU256Gadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
+        log::debug!("BlockCtxU256Gadget assign for {:?}", step.opcode);
+
         self.value_u256
             .same_context
-            .assign_exec_step(region, offset, step)?;
+            .assign_exec_step(region, offset, block, call, step)?;
 
         let value = block.rws[step.rw_indices[0]].stack_value();
 
@@ -188,17 +188,20 @@ impl<F: Field> ExecutionGadget<F> for BlockCtxU256Gadget<F> {
     }
 }
 
+#[cfg(feature = "scroll")]
 #[derive(Clone, Debug)]
-pub(crate) struct DifficulityGadget<F> {
+pub(crate) struct DifficultyGadget<F> {
     same_context: SameContextGadget<F>,
 }
 
-impl<F: Field> ExecutionGadget<F> for DifficulityGadget<F> {
-    const NAME: &'static str = "DIFFICULITY";
+#[cfg(feature = "scroll")]
+impl<F: Field> ExecutionGadget<F> for DifficultyGadget<F> {
+    const NAME: &'static str = "DIFFICULTY";
 
-    const EXECUTION_STATE: ExecutionState = ExecutionState::BLOCKCTXU256;
+    const EXECUTION_STATE: ExecutionState = ExecutionState::DIFFICULTY;
 
     fn configure(cb: &mut EVMConstraintBuilder<F>) -> Self {
+        // Always returns 0 for scroll.
         cb.stack_push(0.expr());
         let opcode = cb.query_cell();
         // State transition
@@ -218,21 +221,15 @@ impl<F: Field> ExecutionGadget<F> for DifficulityGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        _block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
-
-        Ok(())
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)
     }
 }
-
-// notice in scroll ,the BASEFEE is invalid and difficulity has been
-// changed
-#[cfg(feature = "scroll")]
-pub(crate) use DifficulityGadget as BlockCtxU256Gadget;
 
 #[cfg(test)]
 mod test {

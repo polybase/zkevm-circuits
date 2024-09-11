@@ -3,15 +3,17 @@ use crate::{
         execution::ExecutionGadget,
         step::ExecutionState,
         util::{
-            constraint_builder::{ConstrainBuilderCommon, EVMConstraintBuilder},
+            constraint_builder::{
+                ConstrainBuilderCommon, EVMConstraintBuilder, StepStateTransition, Transition,
+            },
             math_gadget::IsZeroGadget,
             CachedRegion, Cell,
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::{BlockContextFieldTag, TxFieldTag::BlockNumber},
+    util::Field,
 };
-use eth_types::Field;
 use gadgets::util::{not, Expr};
 use halo2_proofs::{circuit::Value, plonk::Error};
 
@@ -39,6 +41,7 @@ impl<F: Field> ExecutionGadget<F> for EndInnerBlockGadget<F> {
     const EXECUTION_STATE: ExecutionState = ExecutionState::EndInnerBlock;
 
     fn configure(cb: &mut EVMConstraintBuilder<F>) -> Self {
+        // `cb.curr.state.block_number` is constrained inside execution.rs
         // The number of txs in the inner block is also the ID of the last tx in the
         // block.
         let last_tx_id = cb.query_cell();
@@ -75,20 +78,28 @@ impl<F: Field> ExecutionGadget<F> for EndInnerBlockGadget<F> {
 
         // Depending on whether or not this is the final inner block, we must constrain
         // the next step's block number.
-        let next_step_end_block = cb.next.execution_state_selector([ExecutionState::EndBlock]);
-        cb.condition(next_step_end_block.clone(), |cb| {
+        let next_step_padding = cb.next.execution_state_selector([ExecutionState::Padding]);
+        cb.condition(next_step_padding.clone(), |cb| {
             cb.require_equal(
                 "block number does not change if this is the last inner block",
                 cb.next.state.block_number.expr(),
                 cb.curr.state.block_number.expr(),
             );
         });
-        cb.condition(not::expr(next_step_end_block), |cb| {
+        cb.condition(not::expr(next_step_padding), |cb| {
             cb.require_equal(
                 "block number increments if there are more inner blocks",
                 cb.next.state.block_number.expr(),
                 cb.curr.state.block_number.expr() + 1.expr(),
             );
+        });
+
+        cb.require_step_state_transition(StepStateTransition {
+            rw_counter: Transition::Same,
+            // We propagate call_id so that EndBlock can get the last tx_id
+            // in order to count processed txs.
+            // call_id: Transition::Same,
+            ..StepStateTransition::any()
         });
 
         Self {
@@ -104,7 +115,7 @@ impl<F: Field> ExecutionGadget<F> for EndInnerBlockGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         tx: &Transaction,
         _: &Call,
         step: &ExecStep,

@@ -1,28 +1,29 @@
 use super::{AccountMatch, StateTest, StateTestResult};
-use crate::config::TestSuite;
-use bus_mapping::{
-    circuit_input_builder::{CircuitInputBuilder, CircuitsParams, PrecompileEcParams},
-    state_db::CodeDB,
-};
+use crate::{config::TestSuite, utils::ETH_CHAIN_ID};
+use bus_mapping::circuit_input_builder::{CircuitInputBuilder, CircuitsParams, PrecompileEcParams};
 use eth_types::{
-    geth_types, geth_types::TxType, Address, Bytes, GethExecTrace, ToBigEndian, ToWord, H256, U256,
+    geth_types, state_db::CodeDB, Address, Bytes, GethExecTrace, ToBigEndian, ToWord, H256, U256,
     U64,
 };
-use ethers_core::{
-    types::{transaction::eip2718::TypedTransaction, TransactionRequest},
-    utils::keccak256,
-};
+use ethers_core::utils::keccak256;
 use ethers_signers::LocalWallet;
 use external_tracer::{LoggerConfig, TraceConfig};
 use halo2_proofs::{dev::MockProver, halo2curves::bn256::Fr, plonk::Circuit};
 use itertools::Itertools;
-use once_cell::sync::Lazy;
-use std::{collections::HashMap, env, str::FromStr};
+use std::{collections::BTreeMap, env, str::FromStr, sync::LazyLock};
 use thiserror::Error;
 use zkevm_circuits::{
-    bytecode_circuit::circuit::BytecodeCircuit, ecc_circuit::EccCircuit,
-    modexp_circuit::ModExpCircuit, sig_circuit::SigCircuit, super_circuit::SuperCircuit,
-    test_util::CircuitTestBuilder, util::SubCircuit, witness::Block,
+    bytecode_circuit::circuit::BytecodeCircuit,
+    ecc_circuit::EccCircuit,
+    modexp_circuit::ModExpCircuit,
+    sig_circuit::SigCircuit,
+    super_circuit::params::{
+        get_sub_circuit_limit_and_confidence, get_super_circuit_params, ScrollSuperCircuit,
+        MAX_VERTICAL_ROWS,
+    },
+    test_util::CircuitTestBuilder,
+    util::SubCircuit,
+    witness::Block,
 };
 
 /// Read env var with default value
@@ -32,7 +33,7 @@ pub fn read_env_var<T: Clone + FromStr>(var_name: &'static str, default: T) -> T
         .unwrap_or(default)
 }
 /// Which circuit to test. Default is evm + state.
-pub static CIRCUIT: Lazy<String> = Lazy::new(|| read_env_var("CIRCUIT", "".to_string()));
+pub static CIRCUIT: LazyLock<String> = LazyLock::new(|| read_env_var("CIRCUIT", "".to_string()));
 
 #[derive(PartialEq, Eq, Error, Debug)]
 pub enum StateTestError {
@@ -45,7 +46,7 @@ pub enum StateTestError {
     NonceMismatch { expected: U256, found: U256 },
     #[error("CodeMismatch(expected: {expected:?}, found:{found:?})")]
     CodeMismatch { expected: Bytes, found: Bytes },
-    #[error("StorgeMismatch(slot:{slot:?} expected:{expected:?}, found: {found:?})")]
+    #[error("StorageMismatch(slot:{slot:?} expected:{expected:?}, found: {found:?})")]
     StorageMismatch {
         slot: U256,
         expected: U256,
@@ -64,6 +65,8 @@ pub enum StateTestError {
     SkipTestBalanceOverflow,
     #[error("Exception(expected:{expected:?}, found:{found:?})")]
     Exception { expected: bool, found: String },
+    #[error("CircuitOverflow(circuit:{circuit:?}, needed:{needed:?})")]
+    CircuitOverflow { circuit: String, needed: usize },
 }
 
 impl StateTestError {
@@ -92,7 +95,8 @@ pub struct CircuitsConfig {
 
 fn check_post(
     builder: &CircuitInputBuilder,
-    post: &HashMap<Address, AccountMatch>,
+    post: &BTreeMap<Address, AccountMatch>,
+    st: &StateTest,
 ) -> Result<(), StateTestError> {
     log::trace!("check post");
     // check if the generated account data is the expected one
@@ -100,11 +104,16 @@ fn check_post(
         let (_, actual) = builder.sdb.get_account(address);
 
         if expected.balance.map(|v| v == actual.balance) == Some(false) {
-            log::error!("balance mismatch, expected {expected:?} actual {actual:?}");
-            return Err(StateTestError::BalanceMismatch {
-                expected: expected.balance.unwrap(),
-                found: actual.balance,
-            });
+            log::warn!(
+                "balance mismatch, expected {expected:?} actual {actual:?}, addr {address:?}"
+            );
+            if *address != st.env.current_coinbase {
+                // Scroll EVM will not burn basefee
+                return Err(StateTestError::BalanceMismatch {
+                    expected: expected.balance.unwrap(),
+                    found: actual.balance,
+                });
+            }
         }
 
         if expected.nonce.map(|v| v == actual.nonce) == Some(false) {
@@ -122,6 +131,10 @@ fn check_post(
                 std::borrow::Cow::Borrowed(&builder.code_db.0[&actual.code_hash])
             };
             if &actual_code as &[u8] != expected_code.0 {
+                log::error!(
+                    "code mismatch, address {address:?} actual.code_hash {:?}",
+                    actual.code_hash
+                );
                 return Err(StateTestError::CodeMismatch {
                     expected: expected_code.clone(),
                     found: Bytes::from(actual_code.to_vec()),
@@ -147,24 +160,14 @@ fn check_post(
 }
 
 fn into_traceconfig(st: StateTest) -> (String, TraceConfig, StateTestResult) {
-    let chain_id = 1;
-    let wallet = LocalWallet::from_str(&hex::encode(st.secret_key.0)).unwrap();
-    let mut tx = TransactionRequest::new()
-        .chain_id(chain_id)
-        .from(st.from)
-        .nonce(st.nonce)
-        .value(st.value)
-        .data(st.data.clone())
-        .gas(st.gas_limit)
-        .gas_price(st.gas_price);
+    let tx_type = st.tx_type();
+    let tx = st.build_tx();
 
-    if let Some(to) = st.to {
-        tx = tx.to(to);
-    }
+    let wallet = LocalWallet::from_str(&hex::encode(st.secret_key.0.clone())).unwrap();
+
     let rlp_unsigned = tx.rlp().to_vec();
-    let tx: TypedTransaction = tx.into();
-
     let sig = wallet.sign_transaction_sync(&tx).unwrap();
+    let v = st.normalize_sig_v(sig.v);
     let rlp_signed = tx.rlp_signed(&sig).to_vec();
     let tx_hash = keccak256(tx.rlp_signed(&sig));
     let accounts = st.pre;
@@ -172,7 +175,7 @@ fn into_traceconfig(st: StateTest) -> (String, TraceConfig, StateTestResult) {
     (
         st.id,
         TraceConfig {
-            chain_id: 1,
+            chain_id: ETH_CHAIN_ID,
             history_hashes: vec![U256::from_big_endian(st.env.previous_hash.as_bytes())],
             block_constants: geth_types::BlockConstants {
                 coinbase: st.env.current_coinbase,
@@ -184,18 +187,18 @@ fn into_traceconfig(st: StateTest) -> (String, TraceConfig, StateTestResult) {
             },
 
             transactions: vec![geth_types::Transaction {
-                tx_type: TxType::Eip155,
+                tx_type,
                 from: st.from,
                 to: st.to,
                 nonce: st.nonce,
                 value: st.value,
                 gas_limit: U256::from(st.gas_limit),
-                gas_price: st.gas_price,
-                gas_fee_cap: U256::zero(),
-                gas_tip_cap: U256::zero(),
+                gas_price: Some(st.gas_price),
+                gas_fee_cap: st.max_fee_per_gas,
+                gas_tip_cap: st.max_priority_fee_per_gas,
                 call_data: st.data,
-                access_list: None,
-                v: sig.v,
+                access_list: st.access_list,
+                v,
                 r: sig.r,
                 s: sig.s,
                 rlp_bytes: rlp_signed,
@@ -204,15 +207,15 @@ fn into_traceconfig(st: StateTest) -> (String, TraceConfig, StateTestResult) {
             }],
             accounts,
             logger_config: LoggerConfig {
-                enable_memory: *bus_mapping::util::CHECK_MEM_STRICT,
+                enable_memory: cfg!(feature = "enable-memory")
+                    || bus_mapping::util::GETH_TRACE_CHECK_LEVEL.should_check(),
+                disable_stack: !(cfg!(feature = "enable-stack")
+                    || bus_mapping::util::GETH_TRACE_CHECK_LEVEL.should_check()),
+                disable_storage: !(cfg!(feature = "enable-storage")
+                    || bus_mapping::util::GETH_TRACE_CHECK_LEVEL.should_check()),
                 ..Default::default()
             },
-            #[cfg(feature = "shanghai")]
-            chain_config: Some(external_tracer::ChainConfig::shanghai()),
-            #[cfg(not(feature = "shanghai"))]
-            chain_config: None,
-            #[cfg(feature = "scroll")]
-            l1_queue_index: 0,
+            ..Default::default()
         },
         st.result,
     )
@@ -269,7 +272,7 @@ fn trace_config_to_witness_block_l2(
     suite: TestSuite,
     circuits_params: CircuitsParams,
     verbose: bool,
-) -> Result<Option<(Block<Fr>, CircuitInputBuilder)>, StateTestError> {
+) -> Result<Option<(eth_types::l2_types::BlockTrace, Block, CircuitInputBuilder)>, StateTestError> {
     let block_trace = external_tracer::l2trace(&trace_config);
 
     let block_trace = match (block_trace, st.exception) {
@@ -295,36 +298,38 @@ fn trace_config_to_witness_block_l2(
         .into_iter()
         .map(From::from)
         .collect::<Vec<_>>();
+
     // if the trace exceed max steps, we cannot fit it into circuit
-    // but we still want to make it go through bus-mapping generation
+    // but sometimes we still want to make it go through bus-mapping generation
+    let always_run_bus_mapping = false;
     let exceed_max_steps = match check_geth_traces(&geth_traces, &suite, verbose) {
-        Err(StateTestError::SkipTestMaxSteps(steps)) => steps,
+        Err(StateTestError::SkipTestMaxSteps(steps)) => {
+            if always_run_bus_mapping {
+                steps
+            } else {
+                return Err(StateTestError::SkipTestMaxSteps(steps));
+            }
+        }
         Err(e) => return Err(e),
         Ok(_) => 0,
     };
 
-    set_env_coinbase(&block_trace.coinbase.address.unwrap());
-    env::set_var("CHAIN_ID", format!("{}", block_trace.chain_id));
-    let difficulty_be_bytes = [0u8; 32];
-    env::set_var("DIFFICULTY", hex::encode(difficulty_be_bytes));
+    eth_types::constants::set_scroll_block_constants_with_trace(&block_trace);
     let mut builder =
-        CircuitInputBuilder::new_from_l2_trace(circuits_params, block_trace, false, false)
+        CircuitInputBuilder::new_from_l2_trace(circuits_params, block_trace.clone(), false)
             .expect("could not handle block tx");
     builder
         .finalize_building()
         .expect("could not finalize building block");
     let mut block =
         zkevm_circuits::witness::block_convert(&builder.block, &builder.code_db).unwrap();
-    zkevm_circuits::witness::block_apply_mpt_state(
-        &mut block,
-        builder.mpt_init_state.as_ref().unwrap(),
-    );
+    block.apply_mpt_updates(builder.mpt_init_state.as_ref().unwrap());
     // as mentioned above, we cannot fit the trace into circuit
     // stop here
     if exceed_max_steps != 0 {
         return Err(StateTestError::SkipTestMaxSteps(exceed_max_steps));
     }
-    Ok(Some((block, builder)))
+    Ok(Some((block_trace, block, builder)))
 }
 
 #[cfg(not(feature = "scroll"))]
@@ -334,7 +339,8 @@ fn trace_config_to_witness_block_l1(
     suite: TestSuite,
     circuits_params: CircuitsParams,
     verbose: bool,
-) -> Result<Option<(Block<Fr>, CircuitInputBuilder)>, StateTestError> {
+) -> Result<Option<(Block, CircuitInputBuilder)>, StateTestError> {
+    use eth_types::geth_types::TxType;
     use ethers_signers::Signer;
 
     let geth_traces = external_tracer::trace(&trace_config);
@@ -363,11 +369,18 @@ fn trace_config_to_witness_block_l1(
         .into_iter()
         .enumerate()
         .map(|(index, tx)| eth_types::Transaction {
+            transaction_type: match tx.tx_type {
+                TxType::Eip1559 => Some(2.into()),
+                TxType::Eip2930 => Some(1.into()),
+                _ => None,
+            },
             from: tx.from,
             to: tx.to,
             value: tx.value,
             input: tx.call_data,
-            gas_price: Some(tx.gas_price),
+            max_priority_fee_per_gas: tx.gas_tip_cap,
+            max_fee_per_gas: tx.gas_fee_cap,
+            gas_price: tx.gas_price,
             access_list: tx.access_list,
             nonce: tx.nonce,
             gas: tx.gas_limit,
@@ -380,7 +393,6 @@ fn trace_config_to_witness_block_l1(
             ..eth_types::Transaction::default()
         })
         .collect();
-
     let eth_block = eth_types::Block {
         author: Some(trace_config.block_constants.coinbase),
         timestamp: trace_config.block_constants.timestamp,
@@ -396,7 +408,7 @@ fn trace_config_to_witness_block_l1(
     let wallet: LocalWallet = ethers_core::k256::ecdsa::SigningKey::from_slice(&st.secret_key)
         .unwrap()
         .into();
-    let mut wallets = HashMap::new();
+    let mut wallets = std::collections::HashMap::new();
     wallets.insert(
         wallet.address(),
         wallet.with_chain_id(trace_config.chain_id),
@@ -409,6 +421,7 @@ fn trace_config_to_witness_block_l1(
         geth_traces: geth_traces.clone(),
         accounts: trace_config.accounts.values().cloned().collect(),
         eth_block: eth_block.clone(),
+        ..Default::default()
     };
 
     let block_data =
@@ -419,71 +432,13 @@ fn trace_config_to_witness_block_l1(
         .handle_block(&eth_block, &geth_traces)
         .map_err(|err| StateTestError::CircuitInput(err.to_string()))?;
 
-    let block: Block<Fr> =
+    let block: Block =
         zkevm_circuits::evm_circuit::witness::block_convert(&builder.block, &builder.code_db)
             .unwrap();
     Ok(Some((block, builder)))
 }
 
-////// params for degree = 20 ////////////
-pub const MAX_TXS: usize = 100;
-pub const MAX_INNER_BLOCKS: usize = 100;
-pub const MAX_EXP_STEPS: usize = 10_000;
-pub const MAX_CALLDATA: usize = 350_000;
-pub const MAX_RLP_ROWS: usize = 800_000;
-pub const MAX_BYTECODE: usize = 600_000;
-pub const MAX_MPT_ROWS: usize = 1_000_000;
-pub const MAX_KECCAK_ROWS: usize = 1_000_000;
-pub const MAX_POSEIDON_ROWS: usize = 1_000_000;
-pub const MAX_VERTICAL_ROWS: usize = 1_000_000;
-pub const MAX_RWS: usize = 1_000_000;
-pub const MAX_PRECOMPILE_EC_ADD: usize = 50;
-pub const MAX_PRECOMPILE_EC_MUL: usize = 50;
-pub const MAX_PRECOMPILE_EC_PAIRING: usize = 2;
-
-// TODO: refactor & usage
-fn get_sub_circuit_limit_l2() -> Vec<usize> {
-    vec![
-        MAX_RWS,           // evm
-        MAX_RWS,           // state
-        MAX_BYTECODE,      // bytecode
-        MAX_RWS,           // copy
-        MAX_KECCAK_ROWS,   // keccak
-        MAX_RWS,           // tx
-        MAX_RLP_ROWS,      // rlp
-        8 * MAX_EXP_STEPS, // exp
-        MAX_KECCAK_ROWS,   // modexp
-        MAX_RWS,           // pi
-        MAX_POSEIDON_ROWS, // poseidon
-        MAX_VERTICAL_ROWS, // sig
-        MAX_VERTICAL_ROWS, // ecc
-        MAX_MPT_ROWS,      // mpt
-    ]
-}
-
-fn get_params_for_super_circuit_test_l2() -> CircuitsParams {
-    CircuitsParams {
-        max_evm_rows: MAX_RWS,
-        max_rws: MAX_RWS,
-        max_copy_rows: MAX_RWS,
-        max_txs: MAX_TXS,
-        max_calldata: MAX_CALLDATA,
-        max_bytecode: MAX_BYTECODE,
-        max_inner_blocks: MAX_INNER_BLOCKS,
-        max_keccak_rows: MAX_KECCAK_ROWS,
-        max_poseidon_rows: MAX_POSEIDON_ROWS,
-        max_vertical_circuit_rows: MAX_VERTICAL_ROWS,
-        max_exp_steps: MAX_EXP_STEPS,
-        max_mpt_rows: MAX_MPT_ROWS,
-        max_rlp_rows: MAX_RLP_ROWS,
-        max_ec_ops: PrecompileEcParams {
-            ec_add: MAX_PRECOMPILE_EC_ADD,
-            ec_mul: MAX_PRECOMPILE_EC_MUL,
-            ec_pairing: MAX_PRECOMPILE_EC_PAIRING,
-        },
-    }
-}
-
+/*
 fn get_params_for_super_circuit_test() -> CircuitsParams {
     CircuitsParams {
         max_txs: MAX_TXS,
@@ -506,6 +461,7 @@ fn get_params_for_super_circuit_test() -> CircuitsParams {
         },
     }
 }
+*/
 
 fn get_params_for_sub_circuit_test() -> CircuitsParams {
     CircuitsParams {
@@ -530,7 +486,7 @@ fn get_params_for_sub_circuit_test() -> CircuitsParams {
     }
 }
 
-fn test_with<C: SubCircuit<Fr> + Circuit<Fr>>(block: &Block<Fr>) {
+fn test_with<C: SubCircuit<Fr> + Circuit<Fr>>(block: &Block) {
     let num_row = C::min_num_rows_block(block).1;
     let k = zkevm_circuits::util::log2_ceil(num_row + 256);
     log::debug!(
@@ -543,8 +499,6 @@ fn test_with<C: SubCircuit<Fr> + Circuit<Fr>>(block: &Block<Fr>) {
     prover.assert_satisfied_par();
 }
 
-type ScrollSuperCircuit = SuperCircuit<Fr, MAX_TXS, MAX_CALLDATA, MAX_INNER_BLOCKS, 0x100>;
-
 pub fn run_test(
     st: StateTest,
     suite: TestSuite,
@@ -554,6 +508,7 @@ pub fn run_test(
     log::info!("{test_id}: run-test BEGIN - {circuits_config:?}");
 
     // get the geth traces
+    #[cfg_attr(not(feature = "scroll"), allow(unused_mut))]
     let (_, mut trace_config, post) = into_traceconfig(st.clone());
 
     let balance_overflow = trace_config
@@ -573,79 +528,88 @@ pub fn run_test(
     } else {
         // params for super circuit
         if cfg!(feature = "scroll") {
-            get_params_for_super_circuit_test_l2()
+            get_super_circuit_params()
         } else {
-            get_params_for_super_circuit_test()
+            unreachable!("why are we testing super circuit with L1 mode?");
+            //get_params_for_super_circuit_test()
         }
     };
 
     #[cfg(feature = "scroll")]
-    let result = trace_config_to_witness_block_l2(
-        trace_config.clone(),
-        st.clone(),
-        suite.clone(),
-        circuits_params,
-        circuits_config.verbose,
-    )?;
+    let (scroll_trace, witness_block, mut builder) = {
+        let result = trace_config_to_witness_block_l2(
+            trace_config.clone(),
+            st.clone(),
+            suite.clone(),
+            circuits_params,
+            circuits_config.verbose,
+        )?;
+        match result {
+            Some((scroll_trace, witness_block, builder)) => (scroll_trace, witness_block, builder),
+            None => return Ok(()),
+        }
+    };
     #[cfg(not(feature = "scroll"))]
-    let result = trace_config_to_witness_block_l1(
-        trace_config.clone(),
-        st.clone(),
-        suite.clone(),
-        circuits_params,
-        circuits_config.verbose,
-    )?;
-
-    let (witness_block, mut builder) = match result {
-        Some((witness_block, builder)) => (witness_block, builder),
-        None => return Ok(()),
+    let (witness_block, mut builder) = {
+        let result = trace_config_to_witness_block_l1(
+            trace_config.clone(),
+            st.clone(),
+            suite.clone(),
+            circuits_params,
+            circuits_config.verbose,
+        )?;
+        match result {
+            Some((witness_block, builder)) => (witness_block, builder),
+            None => return Ok(()),
+        }
     };
 
     log::debug!("witness_block created");
     //builder.sdb.list_accounts();
 
-    let check_ccc = || {
-        let row_usage = ScrollSuperCircuit::min_num_rows_block_subcircuits(&witness_block);
-        let mut overflow = false;
-        for (num, limit) in row_usage.iter().zip_eq(get_sub_circuit_limit_l2().iter()) {
-            if num.row_num_real > *limit {
-                log::warn!(
-                    "ccc detail: suite.id {}, st.id {}, circuit {}, num {}, limit {}",
-                    suite.id,
-                    st.id,
-                    num.name,
-                    num.row_num_real,
-                    limit
-                );
-                overflow = true;
-            }
-        }
-        let max_row_usage = row_usage.iter().max_by_key(|r| r.row_num_real).unwrap();
-        if overflow {
+    let row_usage = ScrollSuperCircuit::min_num_rows_block_subcircuits(&witness_block);
+    let mut overflow = false;
+    for (num, limit) in row_usage.iter().zip_eq(
+        get_sub_circuit_limit_and_confidence()
+            .iter()
+            .map(|(limit, _)| limit),
+    ) {
+        if num.row_num_real > *limit {
             log::warn!(
-                "ccc overflow: st.id {}, detail {} {}",
+                "ccc detail: suite.id {}, st.id {}, circuit {}, num {}, limit {}",
+                suite.id,
                 st.id,
-                max_row_usage.name,
-                max_row_usage.row_num_real
+                num.name,
+                num.row_num_real,
+                limit
             );
-            panic!("{} {}", max_row_usage.name, max_row_usage.row_num_real);
-        } else {
-            log::info!(
-                "ccc ok: st.id {}, detail {} {}",
-                st.id,
-                max_row_usage.name,
-                max_row_usage.row_num_real
-            );
+            overflow = true;
         }
-    };
+    }
+    let max_row_usage = row_usage.iter().max_by_key(|r| r.row_num_real).unwrap();
+    if overflow {
+        log::warn!(
+            "ccc overflow: st.id {}, detail {} {}",
+            st.id,
+            max_row_usage.name,
+            max_row_usage.row_num_real
+        );
+        // panic!("{} {}", max_row_usage.name, max_row_usage.row_num_real);
+        return Err(StateTestError::CircuitOverflow {
+            circuit: max_row_usage.name.to_string(),
+            needed: max_row_usage.row_num_real,
+        });
+    }
+    log::info!(
+        "ccc ok: st.id {}, detail {} {}",
+        st.id,
+        max_row_usage.name,
+        max_row_usage.row_num_real
+    );
 
     if !circuits_config.super_circuit {
         if (*CIRCUIT).is_empty() {
-            CircuitTestBuilder::<1, 1>::new_from_block(witness_block)
-                .copy_checks(None)
-                .run();
-        } else if (*CIRCUIT) == "ccc" {
-            check_ccc();
+            CircuitTestBuilder::<1, 1>::new_from_block(witness_block).run();
         } else {
             match (*CIRCUIT).as_str() {
                 "modexp" => test_with::<ModExpCircuit<Fr>>(&witness_block),
@@ -667,22 +631,23 @@ pub fn run_test(
         }
     } else {
         log::debug!("test super circuit {}", *CIRCUIT);
-        if (*CIRCUIT) == "ccc" {
-            check_ccc();
-        } else {
-            #[cfg(feature = "inner-prove")]
-            {
-                set_env_coinbase(&st.env.current_coinbase);
-                prover::test::inner_prove(&test_id, &witness_block);
-            }
-            #[cfg(feature = "chunk-prove")]
-            {
-                set_env_coinbase(&st.env.current_coinbase);
-                prover::test::chunk_prove(&test_id, &witness_block);
-            }
-            #[cfg(not(any(feature = "inner-prove", feature = "chunk-prove")))]
-            mock_prove(&test_id, &witness_block);
+
+        // TODO: these codes are too difficult to maintain.
+        // The correct way is to dump trace files,
+        // and use separate tools to test trace files.
+        #[cfg(feature = "inner-prove")]
+        {
+            eth_types::constants::set_env_coinbase(&st.env.current_coinbase);
+            prover::test::inner_prove(&test_id, &witness_block);
         }
+        #[cfg(feature = "chunk-prove")]
+        {
+            eth_types::constants::set_env_coinbase(&st.env.current_coinbase);
+            prover::test::chunk_prove(&test_id, prover::ChunkProvingTask::from(vec![scroll_trace]));
+        }
+
+        #[cfg(not(any(feature = "inner-prove", feature = "chunk-prove")))]
+        mock_prove(&test_id, &witness_block);
     };
     log::debug!("balance_overflow = {balance_overflow}");
     log::debug!(
@@ -710,7 +675,7 @@ pub fn run_test(
                     // modified from bus-mapping/src/mock.rs
                     let keccak_code_hash = H256(keccak256(&account.code));
                     let code_hash = CodeDB::hash(&account.code);
-                    *acc_in_local_sdb = bus_mapping::state_db::Account {
+                    *acc_in_local_sdb = eth_types::state_db::Account {
                         nonce: account.nonce,
                         balance: account.balance,
                         storage: account.storage.clone(),
@@ -727,25 +692,14 @@ pub fn run_test(
                 }
             }
         }
-        check_post(&builder, &post)?;
+        check_post(&builder, &post, &st)?;
     }
     log::info!("{test_id}: run-test END");
     Ok(())
 }
 
-#[cfg(feature = "scroll")]
-fn set_env_coinbase(coinbase: &Address) -> String {
-    let coinbase = format!("0x{}", hex::encode(coinbase));
-    env::set_var("COINBASE", &coinbase);
-
-    // Used for inner-prove and chunk-prove.
-    env::set_var("INNER_LAYER_ID", &coinbase);
-
-    coinbase
-}
-
 #[cfg(not(any(feature = "inner-prove", feature = "chunk-prove")))]
-fn mock_prove(test_id: &str, witness_block: &Block<Fr>) {
+fn mock_prove(test_id: &str, witness_block: &Block) {
     log::info!("{test_id}: mock-prove BEGIN");
     // TODO: do we need to automatically adjust this k?
     let k = 20;

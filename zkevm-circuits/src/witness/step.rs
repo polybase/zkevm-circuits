@@ -169,6 +169,7 @@ impl From<&circuit_input_builder::ExecStep> for ExecutionState {
                     OpcodeId::EXP => ExecutionState::EXP,
                     OpcodeId::POP => ExecutionState::POP,
                     OpcodeId::BYTE => ExecutionState::BYTE,
+                    OpcodeId::MCOPY => ExecutionState::MCOPY,
                     OpcodeId::MLOAD => ExecutionState::MEMORY,
                     OpcodeId::MSTORE => ExecutionState::MEMORY,
                     OpcodeId::MSTORE8 => ExecutionState::MEMORY,
@@ -187,7 +188,11 @@ impl From<&circuit_input_builder::ExecStep> for ExecutionState {
                         ExecutionState::BLOCKCTXU64
                     }
                     OpcodeId::COINBASE => ExecutionState::BLOCKCTXU160,
-                    OpcodeId::DIFFICULTY | OpcodeId::BASEFEE => ExecutionState::BLOCKCTXU256,
+                    OpcodeId::BASEFEE => ExecutionState::BLOCKCTXU256,
+                    #[cfg(not(feature = "scroll"))]
+                    OpcodeId::DIFFICULTY => ExecutionState::BLOCKCTXU256,
+                    #[cfg(feature = "scroll")]
+                    OpcodeId::DIFFICULTY => ExecutionState::DIFFICULTY,
                     OpcodeId::GAS => ExecutionState::GAS,
                     OpcodeId::SAR => ExecutionState::SAR,
                     OpcodeId::SELFBALANCE => ExecutionState::SELFBALANCE,
@@ -195,6 +200,8 @@ impl From<&circuit_input_builder::ExecStep> for ExecutionState {
                     OpcodeId::SHL | OpcodeId::SHR => ExecutionState::SHL_SHR,
                     OpcodeId::SLOAD => ExecutionState::SLOAD,
                     OpcodeId::SSTORE => ExecutionState::SSTORE,
+                    OpcodeId::TLOAD => ExecutionState::TLOAD,
+                    OpcodeId::TSTORE => ExecutionState::TSTORE,
                     OpcodeId::CALLDATASIZE => ExecutionState::CALLDATASIZE,
                     OpcodeId::CALLDATACOPY => ExecutionState::CALLDATACOPY,
                     OpcodeId::CHAINID => ExecutionState::CHAINID,
@@ -232,6 +239,7 @@ impl From<&circuit_input_builder::ExecStep> for ExecutionState {
             circuit_input_builder::ExecState::BeginTx => ExecutionState::BeginTx,
             circuit_input_builder::ExecState::EndTx => ExecutionState::EndTx,
             circuit_input_builder::ExecState::EndBlock => ExecutionState::EndBlock,
+            circuit_input_builder::ExecState::Padding => ExecutionState::Padding,
         }
     }
 }
@@ -247,6 +255,7 @@ pub(super) fn step_convert(step: &circuit_input_builder::ExecStep, block_num: u6
                     operation::Target::Memory => RwTableTag::Memory,
                     operation::Target::Stack => RwTableTag::Stack,
                     operation::Target::Storage => RwTableTag::AccountStorage,
+                    operation::Target::TransientStorage => RwTableTag::AccountTransientStorage,
                     operation::Target::TxAccessListAccount => RwTableTag::TxAccessListAccount,
                     operation::Target::TxAccessListAccountStorage => {
                         RwTableTag::TxAccessListAccountStorage

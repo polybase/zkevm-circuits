@@ -2,7 +2,7 @@
 
 use crate::{
     copy_circuit::CopyCircuit,
-    evm_circuit::EvmCircuit,
+    evm_circuit::{cached::EvmCircuitCached, EvmCircuit},
     state_circuit::StateCircuit,
     util::{log2_ceil, SubCircuit},
     witness::{Block, Rw},
@@ -26,6 +26,8 @@ fn init_env_logger() {
     // Enable RUST_LOG during tests
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error")).init();
 }
+
+pub(crate) type FnBlockChecker = Option<Box<dyn Fn(MockProver<Fr>, &Vec<usize>, &Vec<usize>)>>;
 
 #[allow(clippy::type_complexity)]
 /// Struct used to easily generate tests for EVM &| State circuits being able to
@@ -81,11 +83,11 @@ fn init_env_logger() {
 pub struct CircuitTestBuilder<const NACC: usize, const NTX: usize> {
     test_ctx: Option<TestContext<NACC, NTX>>,
     circuits_params: Option<CircuitsParams>,
-    block: Option<Block<Fr>>,
-    evm_checks: Option<Box<dyn Fn(MockProver<Fr>, &Vec<usize>, &Vec<usize>)>>,
-    state_checks: Option<Box<dyn Fn(MockProver<Fr>, &Vec<usize>, &Vec<usize>)>>,
-    copy_checks: Option<Box<dyn Fn(MockProver<Fr>, &Vec<usize>, &Vec<usize>)>>,
-    block_modifiers: Vec<Box<dyn Fn(&mut Block<Fr>)>>,
+    block: Option<Block>,
+    evm_checks: FnBlockChecker,
+    state_checks: FnBlockChecker,
+    copy_checks: FnBlockChecker,
+    block_modifiers: Vec<Box<dyn Fn(&mut Block)>>,
 }
 
 impl<const NACC: usize, const NTX: usize> CircuitTestBuilder<NACC, NTX> {
@@ -125,7 +127,7 @@ impl<const NACC: usize, const NTX: usize> CircuitTestBuilder<NACC, NTX> {
 
     /// Generates a CTBC from a [`Block`] passed with all the other fields
     /// set to [`Default`].
-    pub fn new_from_block(block: Block<Fr>) -> Self {
+    pub fn new_from_block(block: Block) -> Self {
         Self::empty().block(block)
     }
 
@@ -148,7 +150,7 @@ impl<const NACC: usize, const NTX: usize> CircuitTestBuilder<NACC, NTX> {
     }
 
     /// Allows to pass a [`Block`] already built to the constructor.
-    pub fn block(mut self, block: Block<Fr>) -> Self {
+    pub fn block(mut self, block: Block) -> Self {
         self.block = Some(block);
         self
     }
@@ -192,17 +194,15 @@ impl<const NACC: usize, const NTX: usize> CircuitTestBuilder<NACC, NTX> {
     ///
     /// That removes the need in a lot of tests to build the block outside of
     /// the builder because they need to modify something particular.
-    pub fn block_modifier(mut self, modifier: Box<dyn Fn(&mut Block<Fr>)>) -> Self {
+    pub fn block_modifier(mut self, modifier: Box<dyn Fn(&mut Block)>) -> Self {
         self.block_modifiers.push(modifier);
         self
     }
 }
 
 impl<const NACC: usize, const NTX: usize> CircuitTestBuilder<NACC, NTX> {
-    /// Triggers the `CircuitTestBuilder` to convert the [`TestContext`] if any,
-    /// into a [`Block`] and apply the default or provided block_modifiers or
-    /// circuit checks to the provers generated for the State and EVM circuits.
-    pub fn run(self) {
+    /// Return the witness block
+    pub fn build_witness_block(self) -> (Block, FnBlockChecker, FnBlockChecker, FnBlockChecker) {
         let mut params = if let Some(block) = self.block.as_ref() {
             block.circuits_params
         } else {
@@ -211,18 +211,17 @@ impl<const NACC: usize, const NTX: usize> CircuitTestBuilder<NACC, NTX> {
         params.max_txs = NTX;
         log::debug!("params in CircuitTestBuilder: {:?}", params);
 
-        let block: Block<Fr> = if self.block.is_some() {
+        let block: Block = if self.block.is_some() {
             self.block.unwrap()
         } else if self.test_ctx.is_some() {
             // use scroll l2 trace
-            let full_witness_block = false;
+            let full_witness_block = cfg!(feature = "scroll");
             let mut block = if full_witness_block {
                 #[cfg(feature = "scroll")]
                 {
                     let mut builder = CircuitInputBuilder::new_from_l2_trace(
                         params,
                         self.test_ctx.unwrap().l2_trace().clone(),
-                        false,
                         false,
                     )
                     .expect("could not handle block tx");
@@ -231,10 +230,7 @@ impl<const NACC: usize, const NTX: usize> CircuitTestBuilder<NACC, NTX> {
                         .expect("could not finalize building block");
                     let mut block =
                         crate::witness::block_convert(&builder.block, &builder.code_db).unwrap();
-                    crate::witness::block_apply_mpt_state(
-                        &mut block,
-                        &builder.mpt_init_state.unwrap(),
-                    );
+                    block.apply_mpt_updates(&builder.mpt_init_state.unwrap());
                     block
                 }
 
@@ -258,22 +254,29 @@ impl<const NACC: usize, const NTX: usize> CircuitTestBuilder<NACC, NTX> {
         } else {
             panic!("No attribute to build a block was passed to the CircuitTestBuilder")
         };
+        (block, self.evm_checks, self.state_checks, self.copy_checks)
+    }
+    /// Triggers the `CircuitTestBuilder` to convert the [`TestContext`] if any,
+    /// into a [`Block`] and apply the default or provided block_modifiers or
+    /// circuit checks to the provers generated for the State and EVM circuits.
+    pub fn run(self) {
+        let (block, evm_checks, state_checks, copy_checks) = self.build_witness_block();
 
         const NUM_BLINDING_ROWS: usize = 64;
         // Run evm circuit test
-        if let Some(evm_checks) = &self.evm_checks {
+        if let Some(evm_checks) = &evm_checks {
             let k = block.get_evm_test_circuit_degree();
             assert!(k <= 20);
             let (active_gate_rows, active_lookup_rows) = EvmCircuit::<Fr>::get_active_rows(&block);
 
-            let circuit = EvmCircuit::get_test_cicuit_from_block(block.clone());
+            let circuit = EvmCircuitCached::get_test_cicuit_from_block(block.clone());
             let prover = MockProver::<Fr>::run(k, &circuit, vec![]).unwrap();
 
             evm_checks(prover, &active_gate_rows, &active_lookup_rows)
         }
 
         // Run state circuit test
-        if let Some(state_checks) = &self.state_checks {
+        if let Some(state_checks) = &state_checks {
             let (_, rows_needed) = StateCircuit::<Fr>::min_num_rows_block(&block);
             let k: u32 = log2_ceil(rows_needed + NUM_BLINDING_ROWS);
             assert!(k <= 20);
@@ -292,7 +295,7 @@ impl<const NACC: usize, const NTX: usize> CircuitTestBuilder<NACC, NTX> {
         }
 
         // Run copy circuit test
-        if let Some(copy_checks) = &self.copy_checks {
+        if let Some(copy_checks) = &copy_checks {
             let (active_rows, max_rows) = CopyCircuit::<Fr>::min_num_rows_block(&block);
             let k1 = block.get_evm_test_circuit_degree();
             let k2 = log2_ceil(max_rows + NUM_BLINDING_ROWS);

@@ -20,14 +20,13 @@ use crate::{
         EvmCircuit,
     },
     keccak_circuit::KeccakCircuit,
-    sig_circuit::ecdsa::ecdsa_verify_no_pubkey_check,
+    sig_circuit::{ecdsa::ecdsa_verify_no_pubkey_check, utils::*},
     table::{KeccakTable, SigTable},
-    util::{Challenges, Expr, SubCircuit, SubCircuitConfig},
+    util::{Challenges, Expr, Field, SubCircuit, SubCircuitConfig},
 };
 use eth_types::{
     self,
     sign_types::{pk_bytes_le, pk_bytes_swap_endianness, SignData},
-    Field,
 };
 use halo2_base::{
     gates::{range::RangeConfig, GateInstructions, RangeInstructions},
@@ -194,10 +193,10 @@ impl<F: Field> SubCircuitConfig<F> for SigCircuitConfig<F> {
 
         Self {
             ecdsa_config,
+            rlc_column,
+            q_keccak,
             keccak_table,
             sig_table,
-            q_keccak,
-            rlc_column,
         }
     }
 }
@@ -223,7 +222,7 @@ pub struct SigCircuit<F: Field> {
 impl<F: Field> SubCircuit<F> for SigCircuit<F> {
     type Config = SigCircuitConfig<F>;
 
-    fn new_from_block(block: &crate::witness::Block<F>) -> Self {
+    fn new_from_block(block: &crate::witness::Block) -> Self {
         assert!(block.circuits_params.max_txs <= MAX_NUM_SIG);
 
         SigCircuit {
@@ -259,7 +258,7 @@ impl<F: Field> SubCircuit<F> for SigCircuit<F> {
 
     // Since sig circuit / halo2-lib use veticle cell assignment,
     // so the returned pair is consisted of same values
-    fn min_num_rows_block(block: &crate::witness::Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &crate::witness::Block) -> (usize, usize) {
         let row_num = if block.circuits_params.max_vertical_circuit_rows == 0 {
             Self::min_num_rows()
         } else {
@@ -1001,36 +1000,4 @@ impl<F: Field> SigCircuit<F> {
 
         Ok(())
     }
-    /*
-    pub(crate) fn assert_sig_is_valid(
-        &self,
-        config: &SigCircuitConfig<F>,
-        layouter: &mut impl Layouter<F>,
-        sig_verifs: &[AssignedSignatureVerify<F>],
-    ) -> Result<(), Error> {
-        layouter.assign_region(
-            || "ecdsa chip verification",
-            |mut region| {
-                let one = region.assign_fixed(
-                    || "one",
-                    config.fixed_column,
-                    0,
-                    || Value::known(F::one()),
-                )?;
-
-                for (i, sig_verif) in sig_verifs.iter().enumerate() {
-                    log::trace!(
-                        "checking {}-th signature is valid: {:?}",
-                        i,
-                        sig_verif.sig_is_valid.value
-                    );
-
-                    region.constrain_equal(sig_verif.sig_is_valid.cell, one.cell())?;
-                }
-
-                Ok(())
-            },
-        )
-    }
-    */
 }

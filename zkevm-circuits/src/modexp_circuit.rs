@@ -13,11 +13,11 @@ use halo2_proofs::{
 
 use crate::{
     table::ModExpTable,
-    util::{Challenges, SubCircuit, SubCircuitConfig},
+    util::{Challenges, Field, SubCircuit, SubCircuitConfig},
     witness,
 };
 use bus_mapping::circuit_input_builder::BigModExp;
-use eth_types::{Field, Word};
+use eth_types::Word;
 
 //use misc_precompiled_circuit::value_for_assign;
 use misc_precompiled_circuit::circuits::{
@@ -42,8 +42,8 @@ impl<F: Field> SubCircuitConfig<F> for ModExpCircuitConfig {
         let rangecheck_config = RangeCheckChip::configure(meta);
         let modexp_config = ModExpChip::configure(meta, &rangecheck_config);
         Self {
-            rangecheck_config,
             modexp_config,
+            rangecheck_config,
             modexp_table,
         }
     }
@@ -147,7 +147,7 @@ impl<F: Field> SubCircuit<F> for ModExpCircuit<F> {
         8
     }
 
-    fn new_from_block(block: &witness::Block<F>) -> Self {
+    fn new_from_block(block: &witness::Block) -> Self {
         let event_limit = block.circuits_params.max_keccak_rows / MODEXPCONFIG_EACH_CHIP_ROWS;
 
         let mut exp_events = block.get_big_modexp();
@@ -159,13 +159,13 @@ impl<F: Field> SubCircuit<F> for ModExpCircuit<F> {
                 event_limit,
             );
             exp_events.resize(event_limit, Default::default());
-            log::info!("modexp circuit work with maxium {} entries", event_limit);
+            log::info!("modexp circuit work with maximum {} entries", event_limit);
         }
 
         Self(exp_events, Default::default())
     }
 
-    fn min_num_rows_block(block: &witness::Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(block: &witness::Block) -> (usize, usize) {
         let exp_events = block.get_big_modexp();
         let real_len = exp_events.len() * MODEXPCONFIG_EACH_CHIP_ROWS;
         (

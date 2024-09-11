@@ -6,7 +6,8 @@ use crate::{
         util::{
             and,
             common_gadget::{
-                TransferGadgetInfo, TransferWithGasFeeGadget, TxL1FeeGadget, TxL1MsgGadget,
+                TransferGadgetInfo, TransferWithGasFeeGadget, TxAccessListGadget, TxEip1559Gadget,
+                TxL1FeeGadget, TxL1MsgGadget,
             },
             constraint_builder::{
                 ConstrainBuilderCommon, EVMConstraintBuilder, ReversionInfo, StepStateTransition,
@@ -17,6 +18,7 @@ use crate::{
                 ConstantDivisionGadget, ContractCreateGadget, IsEqualGadget, IsZeroGadget,
                 LtGadget, MulWordByU64Gadget, RangeCheckGadget,
             },
+            precompile_gadget::PrecompileGadget,
             CachedRegion, Cell, StepRws, Word,
         },
         witness::{Block, Call, ExecStep, Transaction},
@@ -25,24 +27,22 @@ use crate::{
         AccountFieldTag, BlockContextFieldTag, CallContextFieldTag, RwTableTag,
         TxFieldTag as TxContextFieldTag,
     },
+    util::Field,
 };
-use bus_mapping::circuit_input_builder::CopyDataType;
-use eth_types::{Address, Field, ToLittleEndian, ToScalar, U256};
+use array_init::array_init;
+use bus_mapping::{circuit_input_builder::CopyDataType, precompile::PrecompileCalls};
+use eth_types::{utils::is_precompiled, Address, ToLittleEndian, U256};
 use ethers_core::utils::{get_contract_address, keccak256, rlp::RlpStream};
 use gadgets::util::{expr_from_bytes, not, select, Expr};
+use gadgets::ToScalar;
 use halo2_proofs::{circuit::Value, plonk::Error};
-
-// For Shanghai, EIP-3651 (Warm COINBASE) adds 1 write op for coinbase.
-#[cfg(feature = "shanghai")]
-const SHANGHAI_RW_DELTA: u8 = 1;
-#[cfg(not(feature = "shanghai"))]
-const SHANGHAI_RW_DELTA: u8 = 0;
 
 const PRECOMPILE_COUNT: usize = 9;
 
 #[derive(Clone, Debug)]
 pub(crate) struct BeginTxGadget<F> {
     tx_id: Cell<F>,
+    tx_type: Cell<F>,
     sender_nonce: Cell<F>,
     tx_nonce: Cell<F>,
     tx_gas: Cell<F>,
@@ -62,6 +62,8 @@ pub(crate) struct BeginTxGadget<F> {
     tx_call_data_gas_cost: Cell<F>,
     // The gas cost for rlp-encoded bytes of unsigned tx
     tx_data_gas_cost: Cell<F>,
+    // rlp signed tx bytes' length
+    tx_signed_length: Cell<F>,
     reversion_info: ReversionInfo<F>,
     intrinsic_gas_cost: Cell<F>,
     sufficient_gas_left: RangeCheckGadget<F, N_BYTES_GAS>,
@@ -75,21 +77,29 @@ pub(crate) struct BeginTxGadget<F> {
     call_code_hash_is_empty: IsEqualGadget<F>,
     call_code_hash_is_zero: IsZeroGadget<F>,
     is_precompile_lt: LtGadget<F, N_BYTES_ACCOUNT_ADDRESS>,
+    precompile_gadget: PrecompileGadget<F>,
+    precompile_input_len: Cell<F>, // the number of input bytes taken for the precompile call.
+    precompile_input_bytes_rlc: Cell<F>, // input bytes to precompile call.
     /// Keccak256(RLP([tx_caller_address, tx_nonce]))
     caller_nonce_hash_bytes: [Cell<F>; N_BYTES_WORD],
+    // TODO: we need not need this `keccak_code_hash` for scroll mode?
     keccak_code_hash: Cell<F>,
     init_code_rlc: Cell<F>,
     /// RLP gadget for CREATE address.
     create: ContractCreateGadget<F, false>,
-    is_caller_callee_equal: Cell<F>,
+    // Caller, callee, coinbase, precompile addresses (9) and optional
+    // access-list addresses are added to the access list.
+    // <https://github.com/ethereum/go-ethereum/blob/604e215d1bb070dff98fb76aa965064c74e3633f/core/state/statedb.go#L1098>
+    is_caller_warm: Cell<F>,
+    is_callee_warm: Cell<F>,
+    is_coinbase_warm: Cell<F>,
+    are_precompile_warm: [Cell<F>; PRECOMPILE_COUNT],
     // EIP-3651 (Warm COINBASE) for Shanghai
     coinbase: Cell<F>,
-    // Caller, callee and a list addresses are added to the access list before
-    // coinbase, and may be duplicate.
-    // <https://github.com/ethereum/go-ethereum/blob/604e215d1bb070dff98fb76aa965064c74e3633f/core/state/statedb.go#LL1119C9-L1119C9>
-    is_coinbase_warm: Cell<F>,
     tx_l1_fee: TxL1FeeGadget<F>,
     tx_l1_msg: TxL1MsgGadget<F>,
+    tx_access_list: TxAccessListGadget<F>,
+    tx_eip1559: TxEip1559Gadget<F>,
 }
 
 impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
@@ -102,10 +112,18 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
         let call_id = cb.curr.state.rw_counter.clone();
 
         let tx_id = cb.query_cell();
+        cb.call_context_lookup(
+            1.expr(),
+            Some(call_id.expr()),
+            CallContextFieldTag::TxId,
+            tx_id.expr(),
+        ); // rwc_delta += 1
 
         let sender_nonce = cb.query_cell();
-        let [tx_nonce, tx_gas, tx_caller_address, tx_callee_address, tx_is_create, tx_call_data_length, tx_call_data_gas_cost, tx_data_gas_cost] =
+
+        let [tx_type, tx_nonce, tx_gas, tx_caller_address, tx_callee_address, tx_is_create, tx_call_data_length, tx_call_data_gas_cost, tx_data_gas_cost] =
             [
+                TxContextFieldTag::TxType,
                 TxContextFieldTag::Nonce,
                 TxContextFieldTag::Gas,
                 TxContextFieldTag::CallerAddress,
@@ -117,19 +135,27 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             ]
             .map(|field_tag| cb.tx_context(tx_id.expr(), field_tag, None));
 
+        let tx_signed_length = cb.tx_context(tx_id.expr(), TxContextFieldTag::TxHashLength, None);
+        let tx_access_list = TxAccessListGadget::construct(cb, tx_id.expr(), tx_type.expr());
         let is_call_data_empty = IsZeroGadget::construct(cb, tx_call_data_length.expr());
 
-        let tx_l1_msg = TxL1MsgGadget::construct(cb, tx_id.expr(), tx_caller_address.expr());
+        let tx_l1_msg = TxL1MsgGadget::construct(cb, tx_type.expr(), tx_caller_address.expr());
         let tx_l1_fee = cb.condition(not::expr(tx_l1_msg.is_l1_msg()), |cb| {
             cb.require_equal(
                 "tx.nonce == sender.nonce",
                 tx_nonce.expr(),
                 sender_nonce.expr(),
             );
-            TxL1FeeGadget::construct(cb, tx_id.expr(), tx_data_gas_cost.expr())
+            TxL1FeeGadget::construct(cb, tx_id.expr(), tx_signed_length.expr())
         });
         cb.condition(tx_l1_msg.is_l1_msg(), |cb| {
             cb.require_zero("l1fee is 0 for l1msg", tx_data_gas_cost.expr());
+            // also constrain fee value of tx_l1_fee gadget is zero, such other gadgets can use it
+            // with certain value for l1 type.
+            cb.require_zero(
+                "l1fee is 0 for tx_l1_fee gadget",
+                tx_l1_fee.tx_l1_fee_word().expr(),
+            );
         });
         // the rw delta caused by l1 related handling
         let l1_rw_delta = select::expr(
@@ -147,12 +173,6 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             l1_fee_cost.expr(),
         ); // rwc_delta += 1
 
-        cb.call_context_lookup(
-            1.expr(),
-            Some(call_id.expr()),
-            CallContextFieldTag::TxId,
-            tx_id.expr(),
-        ); // rwc_delta += 1
         let mut reversion_info = cb.reversion_info_write(None); // rwc_delta += 2
         let is_persistent = reversion_info.is_persistent();
         cb.call_context_lookup(
@@ -203,8 +223,6 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             None,
         ); // rwc_delta += 1
 
-        // TODO: Implement EIP 1559 (currently it only supports legacy
-        // transaction format)
         // Calculate transaction gas fee
         let mul_gas_fee_by_gas =
             MulWordByU64Gadget::construct(cb, tx_gas_price.clone(), tx_gas.expr());
@@ -226,26 +244,23 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             not::expr(tx_callee_address_is_zero.expr()),
             is_precompile_lt.expr(),
         ]);
+        let precompile_input_len = cb.query_cell();
 
         let tx_call_data_word_length =
             ConstantDivisionGadget::construct(cb, tx_call_data_length.expr() + 31.expr(), 32);
 
-        // TODO1: Take gas cost of access list (EIP 2930) into consideration.
         // Use intrinsic gas
-        // TODO2: contrain calling precompile directly
+        // TODO2: constrain calling precompile directly
 
         let intrinsic_gas_cost = cb.query_cell();
         cb.condition(not::expr(is_precompile.expr()), |cb| {
             // Calculate gas cost of init code only for EIP-3860 of Shanghai.
-            #[cfg(feature = "shanghai")]
             let init_code_gas_cost = select::expr(
                 tx_is_create.expr(),
                 tx_call_data_word_length.quotient().expr()
                     * eth_types::evm_types::INIT_CODE_WORD_GAS.expr(),
                 0.expr(),
             );
-            #[cfg(not(feature = "shanghai"))]
-            let init_code_gas_cost = 0.expr();
 
             cb.require_equal(
                 "calculate intrinsic gas cost",
@@ -255,6 +270,7 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                     eth_types::evm_types::GasCost::CREATION_TX.expr(),
                     eth_types::evm_types::GasCost::TX.expr(),
                 ) + tx_call_data_gas_cost.expr()
+                    + tx_access_list.gas_cost()
                     + init_code_gas_cost,
             )
         });
@@ -262,8 +278,13 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
         let gas_left = tx_gas.expr() - intrinsic_gas_cost.expr();
         let sufficient_gas_left = RangeCheckGadget::construct(cb, gas_left.clone());
 
-        for addr in 1..=PRECOMPILE_COUNT {
-            cb.account_access_list_write(tx_id.expr(), addr.expr(), 1.expr(), 0.expr(), None);
+        let is_caller_warm = cb.query_bool();
+        let is_callee_warm = cb.query_bool();
+        let is_coinbase_warm = cb.query_bool();
+        let are_precompile_warm = array_init(|_| cb.query_bool());
+
+        for (addr, is_warm) in (1..=PRECOMPILE_COUNT).zip(are_precompile_warm.iter()) {
+            cb.account_access_list_write(tx_id.expr(), addr.expr(), 1.expr(), is_warm.expr(), None);
         } // rwc_delta += PRECOMPILE_COUNT
 
         // Prepare access list of caller and callee
@@ -271,34 +292,25 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             tx_id.expr(),
             tx_caller_address.expr(),
             1.expr(),
-            0.expr(),
+            is_caller_warm.expr(),
             None,
         ); // rwc_delta += 1
-        let is_caller_callee_equal = cb.query_bool();
         cb.account_access_list_write(
             tx_id.expr(),
             call_callee_address.expr(),
             1.expr(),
-            // No extra constraint being used here.
-            // Correctness will be enforced in build_tx_access_list_account_constraints
-            select::expr(
-                is_precompile.expr(),
-                1.expr(),
-                is_caller_callee_equal.expr(),
-            ),
+            is_callee_warm.expr(),
             None,
         ); // rwc_delta += 1
 
         // Query coinbase address for Shanghai.
         let coinbase = cb.query_cell();
-        let is_coinbase_warm = cb.query_bool();
         cb.block_lookup(
             BlockContextFieldTag::Coinbase.expr(),
             cb.curr.state.block_number.expr(),
             coinbase.expr(),
         );
 
-        #[cfg(feature = "shanghai")]
         cb.account_access_list_write(
             tx_id.expr(),
             coinbase.expr(),
@@ -342,6 +354,18 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             tx_value.clone(),
             tx_fee.clone(),
             &mut reversion_info,
+        );
+
+        // Construct EIP-1559 gadget to check sender balance.
+        let tx_eip1559 = TxEip1559Gadget::construct(
+            cb,
+            tx_id.expr(),
+            tx_type.expr(),
+            tx_gas.expr(),
+            &tx_gas_price,
+            tx_l1_fee.tx_l1_fee_word(),
+            &tx_value,
+            transfer_with_gas_fee.sender_balance_prev(),
         );
 
         let caller_nonce_hash_bytes = array_init::array_init(|_| cb.query_byte());
@@ -399,6 +423,7 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                 )
             });
             cb.condition(not::expr(is_call_data_empty.expr()), |cb| {
+                // Constrain the initcode is exactly the code we are executing
                 cb.copy_table_lookup(
                     tx_id.expr(),                    // src_id
                     CopyDataType::TxCalldata.expr(), // src_tag
@@ -473,10 +498,10 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                 //   - Write CallContext IsCreate
                 //   - Write CallContext CodeHash
                 rw_counter: Delta(
-                    22.expr()
+                    23.expr()
                         + l1_rw_delta.expr()
                         + transfer_with_gas_fee.rw_delta()
-                        + SHANGHAI_RW_DELTA.expr()
+                        + tx_access_list.rw_delta_expr()
                         + PRECOMPILE_COUNT.expr(),
                 ),
                 call_id: To(call_id.expr()),
@@ -489,61 +514,151 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                 //  - Callee Account Nonce
                 reversible_write_counter: To(transfer_with_gas_fee.reversible_w_delta() + 1.expr()),
                 log_id: To(0.expr()),
+                end_tx: To(is_call_data_empty.expr()),
                 ..StepStateTransition::new_context()
             });
 
             (init_code_rlc, keccak_code_hash)
         });
 
-        // 2. Handle call to precompiled contracts.
-        cb.condition(is_precompile.expr(), |cb| {
-            cb.require_equal(
-                "precompile should be empty code hash",
-                // FIXME: see in opcodes.rs gen_begin_tx_ops
-                account_code_hash_is_empty_or_zero.expr(),
-                true.expr(),
-            );
-            cb.require_equal(
-                "Go to EndTx when Tx to precompile",
-                cb.next.execution_state_selector([ExecutionState::EndTx]),
-                1.expr(),
-            );
+        /*
+        2. Handle call to precompiled contracts:
+           + Set up the root call's context like the tx is calling non-empty code
+           + constructed the base precompile gadget
+           + connected the additional copy event and the base precompile gadget with a lookup to copy table with following constraints:
+              * copy source is from the `TxCalldata` of current tx id
+              * copy target is the root call we have setup, and with the form of `RlcAcc`
+              * The copied len and rlc of copied bytes would be passed to base precompile gadget,
+                so the base precompile gadget verify the RLC of the call data against its input bytes.
 
-            cb.require_step_state_transition(StepStateTransition {
-                // 7 + TxL1FeeGadget + TransferWithGasFeeGadget associated reads or writes:
-                //   - Write CallContext TxId
-                //   - Write CallContext RwCounterEndOfReversion
-                //   - Write CallContext IsPersistent
-                //   - Write CallContext IsSuccess
-                //   - Write Account (Caller) Nonce
-                //   - Write TxAccessListAccount (Precompile) x PRECOMPILE_COUNT
-                //   - Write TxAccessListAccount (Caller)
-                //   - Write TxAccessListAccount (Callee)
-                //   - Write TxAccessListAccount (Coinbase) only for Shanghai
-                //   - Read Account CodeHash
-                //   - a TxL1FeeGadget
-                //   - a TransferWithGasFeeGadget
-                rw_counter: Delta(
-                    8.expr()
-                        + l1_rw_delta.expr()
-                        + transfer_with_gas_fee.rw_delta()
-                        + SHANGHAI_RW_DELTA.expr()
-                        + PRECOMPILE_COUNT.expr()
-                        // TRICKY:
-                        // Process the reversion only for Precompile in begin TX. Since no
-                        // associated opcodes could process reversion afterwards
-                        // (corresponding to `handle_reversion` call in `gen_begin_tx_ops`).
-                        // TODO:
-                        // Move it to code of generating precompiled operations when implemented.
-                        + not::expr(is_persistent.expr())
-                            * transfer_with_gas_fee.reversible_w_delta(),
-                ),
-                call_id: To(call_id.expr()),
-                // FIXME
-                end_tx: To(1.expr()),
-                ..StepStateTransition::any()
+            Notice we need an additional copy event like we have done in the `CallOp` step
+
+            We simply drop any checks to the output bytes which precompile would return,
+            since they are omitted as the return data from a transaction.
+        */
+        let (precompile_gadget, precompile_input_bytes_rlc) =
+            cb.condition(is_precompile.expr(), |cb| {
+                cb.require_equal(
+                    "precompile should be empty code hash",
+                    // FIXME: see in opcodes.rs gen_begin_tx_ops
+                    account_code_hash_is_empty_or_zero.expr(),
+                    true.expr(),
+                );
+                // cb.require_equal(
+                //     "Go to EndTx when Tx to precompile",
+                //     cb.next.execution_state_selector([ExecutionState::EndTx]),
+                //     1.expr(),
+                // );
+
+                // call's dummy context for precompile.
+                for (field_tag, value) in [
+                    (CallContextFieldTag::ReturnDataOffset, 0.expr()),
+                    (CallContextFieldTag::ReturnDataLength, 0.expr()),
+                ] {
+                    cb.call_context_lookup(true.expr(), Some(call_id.expr()), field_tag, value);
+                }
+
+                // Setup first call's context.
+                for (field_tag, value) in [
+                    (CallContextFieldTag::Depth, 1.expr()),
+                    (CallContextFieldTag::CallerAddress, tx_caller_address.expr()),
+                    (
+                        CallContextFieldTag::CalleeAddress,
+                        call_callee_address.expr(),
+                    ),
+                    (CallContextFieldTag::CallDataOffset, 0.expr()),
+                    (
+                        CallContextFieldTag::CallDataLength,
+                        tx_call_data_length.expr(),
+                    ),
+                    (CallContextFieldTag::Value, tx_value.expr()),
+                    (CallContextFieldTag::IsStatic, 0.expr()),
+                    (CallContextFieldTag::LastCalleeId, 0.expr()),
+                    (CallContextFieldTag::LastCalleeReturnDataOffset, 0.expr()),
+                    (CallContextFieldTag::LastCalleeReturnDataLength, 0.expr()),
+                    (CallContextFieldTag::IsRoot, 1.expr()),
+                    (CallContextFieldTag::IsCreate, tx_is_create.expr()),
+                    (CallContextFieldTag::CodeHash, account_code_hash.expr()),
+                ] {
+                    cb.call_context_lookup(true.expr(), Some(call_id.expr()), field_tag, value);
+                }
+
+                // copy table lookup to verify the copying of bytes:
+                // - from caller's memory (`call_data_length` bytes starting at `call_data_offset`)
+                // - to the precompile input.
+                let precompile_input_bytes_rlc = cb.query_cell_phase2();
+                cb.condition(not::expr(is_call_data_empty.expr()), |cb| {
+                    cb.copy_table_lookup(
+                        tx_id.expr(), //cb.curr.state.call_id.expr(),
+                        CopyDataType::TxCalldata.expr(),
+                        call_id.expr(),
+                        CopyDataType::RlcAcc.expr(),
+                        0.expr(),
+                        precompile_input_len.expr(),
+                        0.expr(),
+                        precompile_input_len.expr(),
+                        precompile_input_bytes_rlc.expr(),
+                        0.expr(), // notice copy from calldata -> rlc do not cost rwc
+                    )
+                }); // rwc_delta += `call_gadget.cd_address.length()` for precompile
+
+                cb.require_step_state_transition(StepStateTransition {
+                    // 23 reads and writes + input data copy:
+                    //   - Write CallContext TxId
+                    //   - Write CallContext RwCounterEndOfReversion
+                    //   - Write CallContext IsPersistent
+                    //   - Write CallContext IsSuccess
+                    //   - Write Account (Caller) Nonce
+                    //   - Write TxAccessListAccount (Precompile) x PRECOMPILE_COUNT
+                    //   - Write TxAccessListAccount (Caller)
+                    //   - Write TxAccessListAccount (Callee)
+                    //   - Write TxAccessListAccount (Coinbase) only for Shanghai
+                    //   - Read Account CodeHash
+                    //   - a TxL1FeeGadget
+                    //   - a TransferWithGasFeeGadget
+                    //   - Write CallContext (Dummy) CallerId
+                    //   - Write CallContext (Dummy) ReturnDataOffset
+                    //   - Write CallContext (Dummy) ReturnDataLength
+                    //   - Write CallContext Depth
+                    //   - Write CallContext CallerAddress
+                    //   - Write CallContext CalleeAddress
+                    //   - Write CallContext CallDataOffset
+                    //   - Write CallContext CallDataLength
+                    //   - Write CallContext Value
+                    //   - Write CallContext IsStatic
+                    //   - Write CallContext LastCalleeId
+                    //   - Write CallContext LastCalleeReturnDataOffset
+                    //   - Write CallContext LastCalleeReturnDataLength
+                    //   - Write CallContext IsRoot
+                    //   - Write CallContext IsCreate
+                    //   - Write CallContext CodeHash
+                    rw_counter: Delta(
+                        24.expr()
+                            + l1_rw_delta.expr()
+                            + transfer_with_gas_fee.rw_delta()
+                            + tx_access_list.rw_delta_expr()
+                            + PRECOMPILE_COUNT.expr(),
+                    ),
+                    call_id: To(call_id.expr()),
+                    is_root: To(true.expr()),
+                    is_create: To(tx_is_create.expr()),
+                    gas_left: To(gas_left.clone()),
+                    reversible_write_counter: To(transfer_with_gas_fee.reversible_w_delta()),
+                    log_id: To(0.expr()),
+                    ..StepStateTransition::any() /* do need to constraint evm status since we
+                                                  * have fixed next step */
+                });
+
+                let precompile_gadget = PrecompileGadget::construct(
+                    cb,
+                    call_callee_address.expr(),
+                    precompile_input_bytes_rlc.expr(),
+                    None,
+                    None,
+                );
+
+                (precompile_gadget, precompile_input_bytes_rlc)
             });
-        });
 
         // 3. Call to account with empty code.
         cb.condition(
@@ -579,10 +694,10 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                     //   - a TxL1FeeGadget
                     //   - a TransferWithGasFeeGadget
                     rw_counter: Delta(
-                        8.expr()
+                        9.expr()
                             + l1_rw_delta.expr()
                             + transfer_with_gas_fee.rw_delta()
-                            + SHANGHAI_RW_DELTA.expr()
+                            + tx_access_list.rw_delta_expr()
                             + PRECOMPILE_COUNT.expr(),
                     ),
                     call_id: To(call_id.expr()),
@@ -652,10 +767,10 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                     //   - Write CallContext IsCreate
                     //   - Write CallContext CodeHash
                     rw_counter: Delta(
-                        21.expr()
+                        22.expr()
                             + l1_rw_delta.expr()
                             + transfer_with_gas_fee.rw_delta()
-                            + SHANGHAI_RW_DELTA.expr()
+                            + tx_access_list.rw_delta_expr()
                             + PRECOMPILE_COUNT.expr(),
                     ),
                     call_id: To(call_id.expr()),
@@ -672,8 +787,9 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
 
         Self {
             tx_id,
-            tx_nonce,
+            tx_type,
             sender_nonce,
+            tx_nonce,
             tx_gas,
             tx_gas_price,
             mul_gas_fee_by_gas,
@@ -690,7 +806,9 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             tx_call_data_word_length,
             tx_call_data_gas_cost,
             tx_data_gas_cost,
+            tx_signed_length,
             reversion_info,
+            intrinsic_gas_cost,
             sufficient_gas_left,
             transfer_with_gas_fee,
             account_code_hash,
@@ -701,17 +819,23 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             call_code_hash,
             call_code_hash_is_empty,
             call_code_hash_is_zero,
-            intrinsic_gas_cost,
             is_precompile_lt,
+            precompile_gadget,
+            precompile_input_len,
+            precompile_input_bytes_rlc,
             caller_nonce_hash_bytes,
-            init_code_rlc,
             keccak_code_hash,
+            init_code_rlc,
             create,
-            is_caller_callee_equal,
-            coinbase,
+            is_caller_warm,
+            is_callee_warm,
             is_coinbase_warm,
+            are_precompile_warm,
+            coinbase,
             tx_l1_fee,
             tx_l1_msg,
+            tx_access_list,
+            tx_eip1559,
         }
     }
 
@@ -719,20 +843,38 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         tx: &Transaction,
         call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        /*
-        for (i, idx) in step.rw_indices.iter().copied().enumerate() {
-            log::trace!("begin_tx assign rw: #{i} {:?}", block.rws[idx]);
-        }
-        */
+        ////////////// RWS ////////////////
+        // TxID
+        // gen_tx_access_list_ops
+        // if L1:
+        //      CodeHash
+        //      if empty:
+        //          CodeHash
+        //          if scroll:
+        //              KeccakCodeHash
+        // else:
+        //      6 l1 fee rw
+        // RwCounterEndOfReversion
+        // IsPersistent
+        // IsSuccess
+        // Nonce
+        // Precompiles
+        // caller addr
+        // callee addr
+        // coinbase
 
         let mut rws = StepRws::new(block, step);
+        let rw = rws.next();
+        debug_assert_eq!(rw.tag(), RwTableTag::CallContext);
+        debug_assert_eq!(rw.field_tag(), Some(CallContextFieldTag::TxId as u64));
 
-        let caller_code_hash = if tx.tx_type.is_l1_msg() {
+        let tx_type = tx.tx_type;
+        let caller_code_hash = if tx_type.is_l1_msg() {
             let caller_code_hash_pair = rws.next().account_codehash_pair();
             assert_eq!(
                 caller_code_hash_pair.0, caller_code_hash_pair.1,
@@ -743,27 +885,12 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             U256::zero()
         };
         self.tx_l1_msg
-            .assign(region, offset, tx.tx_type, caller_code_hash)?;
+            .assign(region, offset, tx_type, caller_code_hash)?;
 
-        ////////////// RWS ////////////////
-        // if L1:
-        //      CodeHash
-        //      if empty:
-        //          CodeHash
-        //          if scroll:
-        //              KeccakCodeHash
-        // else:
-        //      3 l1 fee rw
-        // TxId
-        // RwCounterEndOfReversion
-        // IsPersistent
-        // IsSuccess
-        // Nonce
-        // Precompiles
-        // caller addr
-        // callee addr
-        // coinbase
-        rws.offset_add(if tx.tx_type.is_l1_msg() {
+        // Add access-list RW offset.
+        rws.offset_add(TxAccessListGadget::<F>::rw_delta_value(tx) as usize);
+
+        rws.offset_add(if tx_type.is_l1_msg() {
             if caller_code_hash.is_zero() {
                 assert_eq!(
                     tx.nonce, 0,
@@ -779,29 +906,29 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                 0
             }
         } else {
-            3
+            6
         });
 
         let rw = rws.next();
         debug_assert_eq!(rw.tag(), RwTableTag::CallContext);
         debug_assert_eq!(rw.field_tag(), Some(CallContextFieldTag::L1Fee as u64));
 
-        let rw = rws.next();
-        debug_assert_eq!(rw.tag(), RwTableTag::CallContext);
-        debug_assert_eq!(rw.field_tag(), Some(CallContextFieldTag::TxId as u64));
+        // reversion
         rws.offset_add(3);
 
         let rw = rws.next();
         debug_assert_eq!(rw.tag(), RwTableTag::Account);
         debug_assert_eq!(rw.field_tag(), Some(AccountFieldTag::Nonce as u64));
+
         let nonce_rw = rw.account_nonce_pair();
 
-        rws.offset_add(PRECOMPILE_COUNT + 2);
+        let are_precompile_warm: [_; PRECOMPILE_COUNT] =
+            array_init(|_| rws.next().tx_access_list_value_pair().1);
 
-        #[cfg(feature = "shanghai")]
+        let is_caller_warm = rws.next().tx_access_list_value_pair().1;
+        let is_callee_warm = rws.next().tx_access_list_value_pair().1;
+
         let is_coinbase_warm = rws.next().tx_access_list_value_pair().1;
-        #[cfg(not(feature = "shanghai"))]
-        let is_coinbase_warm = false;
 
         let account_code_hash = rws.next().account_codehash_pair().1;
         let transfer_assign_result = self.transfer_with_gas_fee.assign_from_rws(
@@ -831,6 +958,7 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                     .unwrap_or(account_code_hash),
             ),
         )?;
+
         #[cfg(feature = "scroll")]
         {
             self.account_keccak_code_hash.assign(
@@ -846,6 +974,8 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
 
         self.tx_id
             .assign(region, offset, Value::known(F::from(tx.id as u64)))?;
+        self.tx_type
+            .assign(region, offset, Value::known(F::from(tx_type as u64)))?;
         self.tx_nonce
             .assign(region, offset, Value::known(F::from(tx.nonce)))?;
         self.sender_nonce
@@ -882,6 +1012,44 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             .assign(region, offset, callee_address)?;
         self.is_precompile_lt
             .assign(region, offset, callee_address, F::from(0xA))?;
+        // precompile related assignment.
+        let (precompile_input_len, precompile_input_bytes_rlc) = if tx
+            .callee_address
+            .as_ref()
+            .map(is_precompiled)
+            .unwrap_or_default()
+        {
+            let precompile_call: PrecompileCalls = tx.callee_address.unwrap().0[19].into();
+            let input_len = if let Some(input_len) = precompile_call.input_len() {
+                std::cmp::min(input_len, tx.call_data_length)
+            } else {
+                tx.call_data_length
+            };
+
+            let input_bytes_rlc = region.keccak_rlc(
+                &tx.call_data
+                    .iter()
+                    .cloned()
+                    .take(input_len)
+                    .rev()
+                    .collect::<Vec<_>>(),
+            );
+            log::trace!("input_bytes_rlc: {input_bytes_rlc:?}");
+            self.precompile_gadget
+                .assign(region, offset, precompile_call)?;
+            (input_len as u64, input_bytes_rlc)
+        } else {
+            (0, Value::known(F::zero()))
+        };
+
+        self.precompile_input_len.assign(
+            region,
+            offset,
+            Value::known(F::from(precompile_input_len)),
+        )?;
+        self.precompile_input_bytes_rlc
+            .assign(region, offset, precompile_input_bytes_rlc)?;
+
         self.call_callee_address.assign(
             region,
             offset,
@@ -894,11 +1062,6 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                 .to_scalar()
                 .expect("unexpected Address -> Scalar conversion failure"),
             ),
-        )?;
-        self.is_caller_callee_equal.assign(
-            region,
-            offset,
-            Value::known(F::from(caller_address == callee_address)),
         )?;
         self.tx_is_create
             .assign(region, offset, Value::known(F::from(tx.is_create as u64)))?;
@@ -918,6 +1081,12 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
         )?;
         self.tx_data_gas_cost
             .assign(region, offset, Value::known(F::from(tx.tx_data_gas_cost)))?;
+        self.tx_signed_length.assign(
+            region,
+            offset,
+            Value::known(F::from(tx.rlp_signed.len() as u64)),
+        )?;
+
         self.reversion_info.assign(
             region,
             offset,
@@ -936,7 +1105,7 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             stream.append(&tx.caller_address);
             stream.append(&eth_types::U256::from(tx.nonce));
             let rlp_encoding = stream.out().to_vec();
-            keccak256(&rlp_encoding)
+            keccak256(rlp_encoding)
         };
         for (c, v) in self
             .caller_nonce_hash_bytes
@@ -975,7 +1144,7 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             stream.append(&tx.caller_address);
             stream.append(&eth_types::U256::from(tx.nonce));
             let rlp_encoding = stream.out().to_vec();
-            keccak256(&rlp_encoding)
+            keccak256(rlp_encoding)
         };
         for (c, v) in self
             .caller_nonce_hash_bytes
@@ -1007,6 +1176,16 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             None,
         )?;
 
+        self.is_caller_warm
+            .assign(region, offset, Value::known(F::from(is_caller_warm)))?;
+        self.is_callee_warm
+            .assign(region, offset, Value::known(F::from(is_callee_warm)))?;
+        self.is_coinbase_warm
+            .assign(region, offset, Value::known(F::from(is_coinbase_warm)))?;
+        for (cell, val) in self.are_precompile_warm.iter().zip(are_precompile_warm) {
+            cell.assign(region, offset, Value::known(F::from(val)))?;
+        }
+
         self.coinbase.assign(
             region,
             offset,
@@ -1017,15 +1196,16 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
                     .expect("unexpected Address -> Scalar conversion failure"),
             ),
         )?;
-        self.is_coinbase_warm
-            .assign(region, offset, Value::known(F::from(is_coinbase_warm)))?;
 
         let (tx_l1_fee, tx_l2_fee) = if tx.tx_type.is_l1_msg() {
             log::trace!("tx is l1msg and l1 fee is 0");
             (U256::zero(), U256::zero())
         } else {
             (
-                tx.l1_fee.tx_l1_fee(tx.tx_data_gas_cost).0.into(),
+                tx.l1_fee
+                    .tx_l1_fee(tx.tx_data_gas_cost, tx.rlp_signed.len() as u64)
+                    .0
+                    .into(),
                 tx.gas_price * tx.gas,
             )
         };
@@ -1044,6 +1224,27 @@ impl<F: Field> ExecutionGadget<F> for BeginTxGadget<F> {
             tx.l1_fee,
             tx.l1_fee_committed,
             tx.tx_data_gas_cost,
+            tx.rlp_signed.len().try_into().unwrap(),
+        )?;
+
+        self.tx_access_list.assign(region, offset, tx)?;
+        // get base_fee from block context
+        let base_fee = block
+            .context
+            .ctxs
+            .get(&tx.block_number)
+            .expect("could not find block with number = {tx.block_number}")
+            .base_fee;
+        self.tx_eip1559.assign(
+            region,
+            offset,
+            tx,
+            tx_l1_fee,
+            transfer_assign_result
+                .sender_balance_sub_fee_pair
+                .unwrap()
+                .1,
+            base_fee,
         )
     }
 }
@@ -1404,6 +1605,70 @@ mod test {
         CircuitTestBuilder::new_from_test_ctx(ctx).run();
     }
 
+    #[test]
+    fn begin_tx_precompile_oog_with_value() {
+        let ctx = TestContext::<1, 1>::new(
+            None,
+            |accs| {
+                accs[0].address(MOCK_ACCOUNTS[0]).balance(eth(20));
+            },
+            |mut txs, accs| {
+                txs[0]
+                    .from(accs[0].address)
+                    .to(address!("0x0000000000000000000000000000000000000004"))
+                    .value(eth(1))
+                    .gas((21048 + 17).into()) // 17 < 15 + 3
+                    .input(Bytes::from(vec![0x01, 0x02, 0x03]));
+            },
+            |block, _tx| block.number(0xcafeu64),
+        )
+        .unwrap();
+
+        CircuitTestBuilder::new_from_test_ctx(ctx).run();
+    }
+
+    /// TODO: remove this test after we have built gadget for blake2f/rimp160
+    #[test]
+    fn begin_tx_precompile_fail() {
+        let ctx = TestContext::<1, 1>::new(
+            None,
+            |accs| {
+                accs[0].address(MOCK_ACCOUNTS[0]).balance(eth(20));
+            },
+            |mut txs, accs| {
+                txs[0]
+                    .from(accs[0].address)
+                    .to(address!("0x0000000000000000000000000000000000000003"))
+                    .input(Bytes::from(vec![0x01, 0x02, 0x03]));
+            },
+            |block, _tx| block.number(0xcafeu64),
+        )
+        .unwrap();
+
+        CircuitTestBuilder::new_from_test_ctx(ctx).run();
+    }
+
+    /// from failed testtool case
+    #[test]
+    fn begin_tx_precompile_fail_modexp() {
+        let ctx = TestContext::<1, 1>::new(
+            None,
+            |accs| {
+                accs[0].address(MOCK_ACCOUNTS[0]).balance(eth(20));
+            },
+            |mut txs, accs| {
+                txs[0]
+                    .from(accs[0].address)
+                    .to(address!("0x0000000000000000000000000000000000000005"))
+                    .input(Bytes::from_str("0x00000000008000000000000000000000000000000000000000000000000000000000000400000000000000000000000a").unwrap());
+            },
+            |block, _tx| block.number(0xcafeu64),
+        )
+        .unwrap();
+
+        CircuitTestBuilder::new_from_test_ctx(ctx).run();
+    }
+
     /// testool case EmptyTransaction3_d0_g0_v0
     #[test]
     fn begin_tx_create_empty_tx() {
@@ -1441,6 +1706,8 @@ mod test {
 
     // Test that we handle the case where account creation tx happens for an account that already
     // has a non-zero balance and codehash.
+    // This is not possible in real world.
+    #[ignore]
     #[test]
     fn create_tx_for_existing_account() {
         let address = Address::repeat_byte(23);

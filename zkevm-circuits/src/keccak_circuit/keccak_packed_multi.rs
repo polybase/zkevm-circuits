@@ -1,8 +1,9 @@
 use super::{cell_manager::*, param::*, util::*};
-use crate::{evm_circuit::util::rlc, util::Challenges};
-use eth_types::Field;
+use crate::{
+    evm_circuit::util::rlc,
+    util::{Challenges, Field},
+};
 use halo2_proofs::{
-    arithmetic::FieldExt,
     circuit::Value,
     plonk::{Error, Expression},
 };
@@ -137,7 +138,7 @@ pub(crate) struct KeccakRegion<F> {
     pub(crate) rows: Vec<Vec<F>>,
 }
 
-impl<F: FieldExt> KeccakRegion<F> {
+impl<F: Field> KeccakRegion<F> {
     pub(crate) fn new() -> Self {
         Self { rows: Vec::new() }
     }
@@ -157,8 +158,10 @@ impl<F: FieldExt> KeccakRegion<F> {
 /// Recombines parts back together
 pub(crate) mod decode {
     use super::{Part, PartValue};
-    use crate::{keccak_circuit::param::BIT_COUNT, util::Expr};
-    use eth_types::Field;
+    use crate::{
+        keccak_circuit::param::BIT_COUNT,
+        util::{Expr, Field},
+    };
     use halo2_proofs::plonk::Expression;
 
     pub(crate) fn expr<F: Field>(parts: Vec<Part<F>>) -> Expression<F> {
@@ -180,9 +183,8 @@ pub(crate) mod split {
     use crate::{
         evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
         keccak_circuit::util::{pack, pack_part, unpack, WordParts},
-        util::Expr,
+        util::{Expr, Field},
     };
-    use eth_types::Field;
     use halo2_proofs::plonk::{ConstraintSystem, Expression};
 
     #[allow(clippy::too_many_arguments)]
@@ -246,9 +248,8 @@ pub(crate) mod split_uniform {
             param::BIT_COUNT,
             util::{pack, pack_part, rotate, rotate_rev, unpack, WordParts},
         },
-        util::Expr,
+        util::{Expr, Field},
     };
-    use eth_types::Field;
     use halo2_proofs::plonk::{ConstraintSystem, Expression};
 
     #[allow(clippy::too_many_arguments)]
@@ -410,7 +411,7 @@ pub(crate) mod split_uniform {
 // Transform values using a lookup table
 pub(crate) mod transform {
     use super::{transform_to, CellManager, KeccakRegion, Part, PartValue};
-    use eth_types::Field;
+    use crate::util::Field;
     use halo2_proofs::plonk::{ConstraintSystem, TableColumn};
 
     #[allow(clippy::too_many_arguments)]
@@ -467,9 +468,8 @@ pub(crate) mod transform_to {
     use super::{Cell, KeccakRegion, Part, PartValue};
     use crate::{
         keccak_circuit::util::{pack, to_bytes, unpack},
-        util::Expr,
+        util::{Expr, Field},
     };
-    use eth_types::Field;
     use halo2_proofs::plonk::{ConstraintSystem, TableColumn};
 
     #[allow(clippy::too_many_arguments)]
@@ -888,13 +888,14 @@ pub(crate) fn keccak<F: Field>(
     }
 }
 
-/// ...
+/// Genenrate keccak circuit witness from preimages
 pub fn multi_keccak<F: Field>(
     bytes: &[Vec<u8>],
     challenges: Challenges<Value<F>>,
     capacity: Option<usize>,
 ) -> Result<Vec<KeccakRow<F>>, Error> {
     log::info!("multi_keccak assign with capacity: {:?}", capacity);
+
     let mut rows: Vec<KeccakRow<F>> = Vec::new();
     if let Some(capacity) = capacity {
         rows.reserve((1 + capacity * (NUM_ROUNDS + 1)) * get_num_rows_per_round());
@@ -918,12 +919,14 @@ pub fn multi_keccak<F: Field>(
         });
     }
 
+    let total_len: usize = bytes.iter().map(|b| b.len()).sum();
+    log::info!("multi keccak total len {total_len}");
     // TODO: optimize the `extend` using Iter?
     let real_rows: Vec<_> = bytes
         .par_iter()
         .flat_map_iter(|bytes| keccak_rows(bytes, challenges))
         .collect();
-    rows.extend(real_rows.into_iter());
+    rows.extend(real_rows);
     debug!("keccak rows len without padding: {}", rows.len());
     if let Some(capacity) = capacity {
         let padding_rows = {

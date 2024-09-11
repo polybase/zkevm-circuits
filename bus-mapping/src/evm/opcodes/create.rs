@@ -6,12 +6,12 @@ use crate::{
     error::{ContractAddressCollisionError, ExecError},
     evm::{Opcode, OpcodeId},
     operation::{AccountField, AccountOp, CallContextField},
-    state_db::CodeDB,
     Error,
 };
 use eth_types::{
     bytecode::BytecodeElement,
     evm_types::{memory::MemoryWordRange, Memory},
+    state_db::CodeDB,
     Bytecode, GethExecStep, ToBigEndian, ToWord, Word, H160, H256,
 };
 use ethers_core::utils::{get_create2_address, keccak256, rlp};
@@ -28,8 +28,40 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
         let mut exec_step = state.new_step(geth_step)?;
 
         let tx_id = state.tx_ctx.id();
-        let callee = state.parse_call(geth_step)?;
         let caller = state.call()?.clone();
+        let address = if IS_CREATE2 {
+            state.create2_address(&geth_steps[0])?
+        } else {
+            state.create_address()?
+        };
+        let callee_account = &state.sdb.get_account(&address).1.clone();
+        let callee_exists = !callee_account.is_empty();
+        let callee_value = state.call_ctx()?.stack.last()?;
+        if !callee_exists && callee_value.is_zero() {
+            state.sdb.get_account_mut(&address).1.storage.clear();
+        }
+
+        let is_address_collision = callee_account.code_hash != CodeDB::empty_code_hash()
+            || callee_account.nonce > Word::zero();
+        // Get caller's balance and nonce
+        let caller_balance = state.sdb.get_balance(&caller.address);
+        let caller_nonce = state.sdb.get_nonce(&caller.address);
+        // Check if an error of ErrDepth, ErrInsufficientBalance or
+        // ErrNonceUintOverflow occurred.
+        let depth = caller.depth;
+        let is_precheck_ok =
+            depth < 1025 && caller_balance >= callee_value && caller_nonce < u64::MAX;
+        let callee = if is_precheck_ok && !is_address_collision {
+            state.parse_call(geth_step)?
+        } else {
+            // if precheck not ok, the call won't appear in call trace since it never happens
+            // we need to increase the offset and manually set the is_success
+            state.tx_ctx.call_is_success_offset += 1;
+            let mut call = state.parse_call_partial(geth_step)?;
+            call.is_success = false;
+            call.is_persistent = false;
+            call
+        };
 
         state.call_context_read(
             &mut exec_step,
@@ -38,7 +70,6 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             tx_id.to_word(),
         )?;
 
-        let depth = caller.depth;
         state.call_context_read(
             &mut exec_step,
             caller.call_id,
@@ -51,8 +82,12 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
         // stack operation
         // Get low Uint64 of offset to generate copy steps. Since offset could
         // be Uint64 overflow if length is zero.
-        let offset = geth_step.stack.nth_last(1)?.low_u64() as usize;
-        let length = geth_step.stack.nth_last(2)?.as_usize();
+        let [offset, length] = {
+            let stack = &state.call_ctx()?.stack;
+            let offset = stack.nth_last(1)?.low_u64() as usize;
+            let length = stack.nth_last(2)?.as_usize();
+            [offset, length]
+        };
 
         if length != 0 {
             state
@@ -70,31 +105,14 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
         )?;
 
         let n_pop = if IS_CREATE2 { 4 } else { 3 };
-        for i in 0..n_pop {
-            state.stack_read(
-                &mut exec_step,
-                geth_step.stack.nth_last_filled(i),
-                geth_step.stack.nth_last(i)?,
-            )?;
+        let stack_inputs = state.stack_pops(&mut exec_step, n_pop)?;
+        #[cfg(feature = "enable-stack")]
+        for (i, value) in stack_inputs.iter().enumerate() {
+            assert_eq!(*value, geth_step.stack.nth_last(i)?);
         }
 
-        let address = if IS_CREATE2 {
-            state.create2_address(&geth_steps[0])?
-        } else {
-            state.create_address()?
-        };
-
-        let callee_account = &state.sdb.get_account(&address).1.clone();
-        let callee_exists = !callee_account.is_empty();
-        let is_address_collision = callee_account.code_hash != CodeDB::empty_code_hash()
-            || callee_account.nonce > Word::zero();
-        if !callee_exists && callee.value.is_zero() {
-            state.sdb.get_account_mut(&address).1.storage.clear();
-        }
-
-        state.stack_write(
+        state.stack_push(
             &mut exec_step,
-            geth_step.stack.nth_last_filled(n_pop - 1),
             if callee.is_success {
                 address.to_word()
             } else {
@@ -102,10 +120,6 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             },
         )?;
         // stack end
-
-        // Get caller's balance and nonce
-        let caller_balance = state.sdb.get_balance(&caller.address);
-        let caller_nonce = state.sdb.get_nonce(&caller.address);
 
         state.call_context_read(
             &mut exec_step,
@@ -128,10 +142,6 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             caller_nonce.into(),
         )?;
 
-        // Check if an error of ErrDepth, ErrInsufficientBalance or
-        // ErrNonceUintOverflow occurred.
-        let is_precheck_ok =
-            depth < 1025 && caller_balance >= callee.value && caller_nonce < u64::MAX;
         if is_precheck_ok {
             // Increase caller's nonce
             state.push_op_reversible(
@@ -203,7 +213,7 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             ),
             (
                 CallContextField::StackPointer,
-                geth_step.stack.nth_last_filled(n_pop - 1).0.into(),
+                state.call_ctx()?.stack.stack_pointer().0.into(),
             ),
             (CallContextField::GasLeft, caller_gas_left.into()),
             (CallContextField::MemorySize, next_memory_word_size.into()),
@@ -215,7 +225,7 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             state.call_context_write(&mut exec_step, caller.call_id, field, value)?;
         }
 
-        let (initialization_code, keccak_code_hash, code_hash) = if is_precheck_ok && length > 0 {
+        let (initcode, keccak_code_hash, code_hash) = if is_precheck_ok && length > 0 {
             handle_copy(state, &mut exec_step, state.call()?.call_id, offset, length)?
         } else {
             (vec![], H256(keccak256([])), CodeDB::empty_code_hash())
@@ -227,15 +237,13 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
         // successful contract creation
         if is_precheck_ok {
             // handle keccak_table_lookup
-            let keccak_input = if IS_CREATE2 {
-                let salt = geth_step.stack.nth_last(3)?;
+            let address_preimage = if IS_CREATE2 {
+                let salt = stack_inputs[3];
+                log::trace!("create2 initcode {}", hex::encode(&initcode));
+                log::trace!("create2 caller {:?}", caller.address);
                 assert_eq!(
                     address,
-                    get_create2_address(
-                        caller.address,
-                        salt.to_be_bytes(),
-                        initialization_code.clone(),
-                    )
+                    get_create2_address(caller.address, salt.to_be_bytes(), initcode.clone())
                 );
                 std::iter::once(0xffu8)
                     .chain(caller.address.to_fixed_bytes())
@@ -251,11 +259,12 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             };
             assert_eq!(
                 address,
-                H160(keccak256(&keccak_input)[12..].try_into().unwrap())
+                H160(keccak256(&address_preimage)[12..].try_into().unwrap())
             );
 
-            state.block.sha3_inputs.push(keccak_input);
-            state.block.sha3_inputs.push(initialization_code);
+            state.block.sha3_inputs.push(address_preimage);
+            // TODO: for scroll mode, initcode don't need to be keccak-ed.
+            state.block.sha3_inputs.push(initcode);
         }
         if is_precheck_ok && !is_address_collision {
             // Transfer function will skip transfer if the value is zero
@@ -315,7 +324,7 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
                 ] {
                     state.call_context_write(&mut exec_step, caller.call_id, field, value)?;
                 }
-                state.handle_return(&mut [&mut exec_step], geth_steps, false)?;
+                state.handle_return((None, None), &mut [&mut exec_step], geth_steps, false)?;
             }
         }
         // failed case: is_precheck_ok is false or is_address_collision is true
@@ -327,7 +336,7 @@ impl<const IS_CREATE2: bool> Opcode for Create<IS_CREATE2> {
             ] {
                 state.call_context_write(&mut exec_step, caller.call_id, field, value)?;
             }
-            state.handle_return(&mut [&mut exec_step], geth_steps, false)?;
+            state.handle_return((None, None), &mut [&mut exec_step], geth_steps, false)?;
         }
         Ok(vec![exec_step])
     }
@@ -344,10 +353,11 @@ fn handle_copy(
     let call_ctx = state.call_ctx_mut()?;
     let memory: &Memory = &mut call_ctx.memory;
 
-    let initialization_bytes = memory.0[offset..offset + length].to_vec();
-    let keccak_code_hash = H256(keccak256(&initialization_bytes));
-    let code_hash = CodeDB::hash(&initialization_bytes);
-    let bytes = Bytecode::from(initialization_bytes.clone()).code;
+    let initcode = memory.0[offset..offset + length].to_vec();
+    let keccak_code_hash = H256(keccak256(&initcode));
+    // TODO: we could avoid this hashing, since parse_call already hashed it.
+    let code_hash = CodeDB::hash(&initcode);
+    let bytes = Bytecode::from(initcode.clone()).code;
 
     let dst_range = MemoryWordRange::align_range(offset, length);
     let mem_read = memory.read_chunk(dst_range);
@@ -386,10 +396,11 @@ fn handle_copy(
             dst_addr: 0,
             log_id: None,
             copy_bytes: CopyBytes::new(copy_steps, None, None),
+            access_list: vec![],
         },
-    );
+    )?;
 
-    Ok((initialization_bytes, keccak_code_hash, code_hash))
+    Ok((initcode, keccak_code_hash, code_hash))
 }
 
 #[cfg(test)]

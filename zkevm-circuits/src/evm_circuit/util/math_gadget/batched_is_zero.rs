@@ -3,9 +3,8 @@ use crate::{
         constraint_builder::{ConstrainBuilderCommon, EVMConstraintBuilder},
         transpose_val_ret, CachedRegion, Cell, CellType,
     },
-    util::Expr,
+    util::{Expr, Field},
 };
-use eth_types::Field;
 use halo2_proofs::{
     circuit::Value,
     plonk::{Error, Expression},
@@ -87,7 +86,9 @@ impl<F: Field, const N: usize> BatchedIsZeroGadget<F, N> {
 #[cfg(test)]
 mod tests {
     use super::{super::test_util::*, *};
+    use crate::util::Field;
     use eth_types::*;
+    use gadgets::ToScalar;
     use halo2_proofs::{halo2curves::bn256::Fr, plonk::Error};
 
     #[derive(Clone)]
@@ -142,7 +143,7 @@ mod tests {
     fn test_batched_1_in_array_not_iszero() {
         try_test!(
             IsZeroGadgetTestContainer<Fr, 5>,
-            vec![
+            [
                 Word::from(0),
                 Word::from(1),
                 Word::from(0),
@@ -167,14 +168,14 @@ mod tests {
 
     #[test]
     fn test_batched_single_cell_not_iszero() {
-        try_test!(IsZeroGadgetTestContainer<Fr, 1>, vec![WORD_LOW_MAX], false);
+        try_test!(IsZeroGadgetTestContainer<Fr, 1>, [WORD_LOW_MAX], false);
     }
 
     #[test]
     fn test_batched_wordmax_bytes_not_iszero() {
         try_test!(
             IsZeroGadgetTestContainer<Fr, 5>,
-            vec![
+            [
                 WORD_LOW_MAX,
                 WORD_LOW_MAX,
                 WORD_LOW_MAX,

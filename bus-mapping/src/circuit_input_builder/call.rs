@@ -1,7 +1,7 @@
 use super::CodeSource;
 use crate::{exec_trace::OperationRef, Error};
 use eth_types::{
-    evm_types::{Memory, OpcodeId},
+    evm_types::{Memory, OpcodeId, Stack},
     Address, Hash, Word,
 };
 
@@ -61,7 +61,7 @@ pub struct Call {
     pub kind: CallKind,
     /// This call is being executed without write access (STATIC)
     pub is_static: bool,
-    /// This call generated implicity by a Transaction.
+    /// This call is generated implicitly by a Transaction
     pub is_root: bool,
     /// This call is persistent or call stack reverts at some point
     pub is_persistent: bool,
@@ -130,7 +130,7 @@ impl Call {
 }
 
 /// Context of a [`Call`].
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CallContext {
     /// Index of call
     pub index: usize,
@@ -143,6 +143,8 @@ pub struct CallContext {
     pub call_data: Vec<u8>,
     /// memory context of current call
     pub memory: Memory,
+    /// stack context of current call
+    pub stack: Stack,
     /// return data buffer
     pub return_data: Vec<u8>,
 }

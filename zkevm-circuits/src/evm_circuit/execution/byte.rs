@@ -10,11 +10,11 @@ use crate::{
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{Expr, Field},
 };
 use array_init::array_init;
 use bus_mapping::evm::OpcodeId;
-use eth_types::{Field, ToLittleEndian};
+use eth_types::ToLittleEndian;
 use halo2_proofs::plonk::Error;
 
 #[derive(Clone, Debug)]
@@ -93,12 +93,13 @@ impl<F: Field> ExecutionGadget<F> for ByteGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         // Inputs/Outputs
         let index = block.rws[step.rw_indices[0]].stack_value().to_le_bytes();

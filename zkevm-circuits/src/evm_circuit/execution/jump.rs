@@ -13,9 +13,9 @@ use crate::{
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{Expr, Field},
 };
-use eth_types::{evm_types::OpcodeId, Field, ToLittleEndian};
+use eth_types::{evm_types::OpcodeId, ToLittleEndian};
 use halo2_proofs::plonk::Error;
 
 #[derive(Clone, Debug)]
@@ -35,13 +35,6 @@ impl<F: Field> ExecutionGadget<F> for JumpGadget<F> {
         // Pop the value from the stack
         cb.stack_pop(destination.expr());
 
-        // Lookup opcode at destination
-        cb.opcode_lookup_at(
-            from_bytes::expr(&destination.cells),
-            OpcodeId::JUMPDEST.expr(),
-            1.expr(),
-        );
-
         // State transition
         let opcode = cb.query_cell();
         let step_state_transition = StepStateTransition {
@@ -53,6 +46,13 @@ impl<F: Field> ExecutionGadget<F> for JumpGadget<F> {
         };
         let same_context = SameContextGadget::construct(cb, opcode, step_state_transition);
 
+        // Lookup opcode at destination
+        cb.opcode_lookup_at(
+            from_bytes::expr(&destination.cells),
+            OpcodeId::JUMPDEST.expr(),
+            same_context.is_first_bytecode_table(),
+        );
+
         Self {
             same_context,
             destination,
@@ -63,12 +63,13 @@ impl<F: Field> ExecutionGadget<F> for JumpGadget<F> {
         &self,
         region: &mut CachedRegion<'_, '_, F>,
         offset: usize,
-        block: &Block<F>,
+        block: &Block,
         _: &Transaction,
-        _: &Call,
+        call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        self.same_context.assign_exec_step(region, offset, step)?;
+        self.same_context
+            .assign_exec_step(region, offset, block, call, step)?;
 
         let destination = block.rws[step.rw_indices[0]].stack_value();
         self.destination.assign(

@@ -3,26 +3,28 @@ use std::collections::BTreeSet;
 
 use bus_mapping::evm::OpcodeId;
 use halo2_proofs::{
-    arithmetic::FieldExt,
     circuit::{Layouter, Value},
     plonk::{Challenge, Circuit, ConstraintSystem, Error, Expression, FirstPhase, VirtualCells},
 };
-use keccak256::plain::Keccak;
 
 #[cfg(feature = "onephase")]
 use halo2_proofs::plonk::FirstPhase as SecondPhase;
 #[cfg(not(feature = "onephase"))]
 use halo2_proofs::plonk::SecondPhase;
+use sha3::Digest;
 
 use crate::{evm_circuit::util::rlc, table::TxLogFieldTag, witness};
-use eth_types::{Field, ToAddress, Word};
+use eth_types::{ToAddress, Word};
 pub use ethers_core::types::{Address, U256};
 pub use gadgets::util::Expr;
 
 /// A wrapper of is_zero in gadgets which gives is_zero at any rotation
 pub mod is_zero;
 
-pub(crate) fn query_expression<F: FieldExt, T>(
+/// The field used in circuits. We only support bn254fr now.
+pub trait Field = gadgets::Field + halo2_base::utils::ScalarField;
+
+pub(crate) fn query_expression<F: Field, T>(
     meta: &mut ConstraintSystem<F>,
     mut f: impl FnMut(&mut VirtualCells<F>) -> T,
 ) -> T {
@@ -34,7 +36,7 @@ pub(crate) fn query_expression<F: FieldExt, T>(
     expr.unwrap()
 }
 
-pub(crate) fn random_linear_combine_word<F: FieldExt>(bytes: [u8; 32], randomness: F) -> F {
+pub(crate) fn random_linear_combine_word<F: Field>(bytes: [u8; 32], randomness: F) -> F {
     rlc::value(&bytes, randomness)
 }
 
@@ -46,12 +48,14 @@ pub(crate) fn rlc_be_bytes<F: Field>(bytes: &[u8], rand: Value<F>) -> Value<F> {
     })
 }
 
-/// All challenges used in `SuperCircuit`.
+/// Wrap multiple challenges:
+/// `construct`: the default construct route to provide all challenges used in `SuperCircuit`.
+/// `construct_p1`: construct challenge up to second phase
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Challenges<T = Challenge> {
     evm_word: T,
     keccak_input: T,
-    lookup_input: T,
+    lookup_input: Option<T>,
 }
 
 /// ..
@@ -59,39 +63,61 @@ pub struct Challenges<T = Challenge> {
 pub struct MockChallenges {
     evm_word: u64,
     keccak_input: u64,
-    lookup_input: u64,
+    lookup_input: Option<u64>,
 }
 
 impl MockChallenges {
     /// ..
-    pub fn construct<F: FieldExt>(_meta: &mut ConstraintSystem<F>) -> Self {
+    pub fn construct<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
+        Self {
+            lookup_input: Some(0x100),
+            ..Self::construct_p1(meta)
+        }
+    }
+    /// ..
+    pub fn construct_p1<F: Field>(_meta: &mut ConstraintSystem<F>) -> Self {
         Self {
             evm_word: 0x100,
             keccak_input: 0x101,
-            lookup_input: 0x100,
+            lookup_input: None,
         }
     }
     /// ..
-    pub fn exprs<F: FieldExt>(&self, _meta: &mut ConstraintSystem<F>) -> Challenges<Expression<F>> {
+    pub fn exprs<F: Field>(&self, _meta: &mut ConstraintSystem<F>) -> Challenges<Expression<F>> {
         Challenges {
             evm_word: Expression::Constant(F::from(self.evm_word)),
             keccak_input: Expression::Constant(F::from(self.keccak_input)),
-            lookup_input: Expression::Constant(F::from(self.lookup_input)),
+            lookup_input: self.lookup_input.map(|c| Expression::Constant(F::from(c))),
         }
     }
     /// ..
-    pub fn values<F: FieldExt>(&self, _layouter: &impl Layouter<F>) -> Challenges<Value<F>> {
+    pub fn values<F: Field>(&self, _layouter: &impl Layouter<F>) -> Challenges<Value<F>> {
         Challenges {
             evm_word: Value::known(F::from(self.evm_word)),
             keccak_input: Value::known(F::from(self.keccak_input)),
-            lookup_input: Value::known(F::from(self.lookup_input)),
+            lookup_input: self.lookup_input.map(|c| Value::known(F::from(c))),
         }
     }
 }
 
 impl Challenges {
+    /// Construct `Challenges` by allocating challenges only to secondary phases.
+    pub fn construct_p1<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
+        #[cfg(any(not(feature = "onephase"), feature = "test", test))]
+        let _dummy_cols = [
+            meta.advice_column(),
+            meta.advice_column_in(halo2_proofs::plonk::SecondPhase),
+        ];
+
+        Self {
+            evm_word: meta.challenge_usable_after(FirstPhase),
+            keccak_input: meta.challenge_usable_after(FirstPhase),
+            lookup_input: None,
+        }
+    }
+
     /// Construct `Challenges` by allocating challenges in specific phases.
-    pub fn construct<F: FieldExt>(meta: &mut ConstraintSystem<F>) -> Self {
+    pub fn construct<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
         #[cfg(any(not(feature = "onephase"), feature = "test", test))]
         let _dummy_cols = [
             meta.advice_column(),
@@ -102,16 +128,18 @@ impl Challenges {
         Self {
             evm_word: meta.challenge_usable_after(FirstPhase),
             keccak_input: meta.challenge_usable_after(FirstPhase),
-            lookup_input: meta.challenge_usable_after(SecondPhase),
+            lookup_input: Some(meta.challenge_usable_after(SecondPhase)),
         }
     }
 
     /// Returns `Expression` of challenges from `ConstraintSystem`.
-    pub fn exprs<F: FieldExt>(&self, meta: &mut ConstraintSystem<F>) -> Challenges<Expression<F>> {
-        let [evm_word, keccak_input, lookup_input] = query_expression(meta, |meta| {
-            [self.evm_word, self.keccak_input, self.lookup_input]
-                .map(|challenge| meta.query_challenge(challenge))
+    pub fn exprs<F: Field>(&self, meta: &mut ConstraintSystem<F>) -> Challenges<Expression<F>> {
+        let [evm_word, keccak_input] = query_expression(meta, |meta| {
+            [self.evm_word, self.keccak_input].map(|challenge| meta.query_challenge(challenge))
         });
+        let lookup_input = self
+            .lookup_input
+            .map(|c| query_expression(meta, |meta| meta.query_challenge(c)));
         Challenges {
             evm_word,
             keccak_input,
@@ -120,11 +148,11 @@ impl Challenges {
     }
 
     /// Returns `Value` of challenges from `Layouter`.
-    pub fn values<F: FieldExt>(&self, layouter: &impl Layouter<F>) -> Challenges<Value<F>> {
+    pub fn values<F: Field>(&self, layouter: &impl Layouter<F>) -> Challenges<Value<F>> {
         Challenges {
             evm_word: layouter.get_challenge(self.evm_word),
             keccak_input: layouter.get_challenge(self.keccak_input),
-            lookup_input: layouter.get_challenge(self.lookup_input),
+            lookup_input: self.lookup_input.map(|c| layouter.get_challenge(c)),
         }
     }
 }
@@ -142,12 +170,21 @@ impl<T: Clone> Challenges<T> {
 
     /// Returns challenge of `lookup_input`.
     pub fn lookup_input(&self) -> T {
-        self.lookup_input.clone()
+        self.lookup_input
+            .as_ref()
+            .expect("created for supercircuit")
+            .clone()
     }
 
     /// Returns the challenges indexed by the challenge index
     pub fn indexed(&self) -> [&T; 3] {
-        [&self.evm_word, &self.keccak_input, &self.lookup_input]
+        [
+            &self.evm_word,
+            &self.keccak_input,
+            self.lookup_input
+                .as_ref()
+                .expect("created for supercircuit"),
+        ]
     }
 
     /// ..
@@ -155,7 +192,7 @@ impl<T: Clone> Challenges<T> {
         Self {
             evm_word,
             keccak_input,
-            lookup_input,
+            lookup_input: Some(lookup_input),
         }
     }
 }
@@ -184,7 +221,12 @@ impl<F: Field> Challenges<Expression<F>> {
 
     /// Returns powers of randomness for lookups
     pub fn lookup_input_powers_of_randomness<const S: usize>(&self) -> [Expression<F>; S] {
-        Self::powers_of(self.lookup_input.clone())
+        Self::powers_of(
+            self.lookup_input
+                .as_ref()
+                .expect("created for supercircuit")
+                .clone(),
+        )
     }
 }
 
@@ -217,7 +259,7 @@ pub trait SubCircuit<F: Field> {
     }
 
     /// Create a new SubCircuit from a witness Block
-    fn new_from_block(block: &witness::Block<F>) -> Self;
+    fn new_from_block(block: &witness::Block) -> Self;
 
     /// Returns the instance columns required for this circuit.
     fn instance(&self) -> Vec<Vec<F>> {
@@ -236,7 +278,7 @@ pub trait SubCircuit<F: Field> {
 
     /// Return the minimum number of rows required to prove the block.
     /// Row numbers without/with padding are both returned.
-    fn min_num_rows_block(block: &witness::Block<F>) -> (usize, usize);
+    fn min_num_rows_block(block: &witness::Block) -> (usize, usize);
 }
 
 /// SubCircuit configuration
@@ -255,9 +297,7 @@ pub fn log2_ceil(n: usize) -> u32 {
 }
 
 pub(crate) fn keccak(msg: &[u8]) -> Word {
-    let mut keccak = Keccak::default();
-    keccak.update(msg);
-    Word::from_big_endian(keccak.digest().as_slice())
+    Word::from_big_endian(sha3::Keccak256::digest(msg).as_slice())
 }
 
 pub(crate) fn is_push_with_data(byte: u8) -> bool {
@@ -272,8 +312,9 @@ pub(crate) fn get_push_size(byte: u8) -> u64 {
     }
 }
 
+/// Basic stats of circuit config
 #[derive(Debug)]
-pub(crate) struct CircuitStats {
+pub struct CircuitStats {
     num_constraints: usize,
     num_fixed_columns: usize,
     num_lookups: usize,
@@ -282,6 +323,7 @@ pub(crate) struct CircuitStats {
     num_selectors: usize,
     num_simple_selectors: usize,
     num_permutation_columns: usize,
+    num_vk_commitment: usize,
     degree: usize,
     blinding_factors: usize,
     num_challenges: usize,
@@ -292,7 +334,8 @@ pub(crate) struct CircuitStats {
     num_verification_ecmul: usize,
 }
 
-pub(crate) fn circuit_stats<F: Field>(meta: &ConstraintSystem<F>) -> CircuitStats {
+/// Basic stats of circuit config
+pub fn circuit_stats<F: Field>(meta: &ConstraintSystem<F>) -> CircuitStats {
     let rotations = meta
         .advice_queries
         .iter()
@@ -311,6 +354,9 @@ pub(crate) fn circuit_stats<F: Field>(meta: &ConstraintSystem<F>) -> CircuitStat
         num_selectors: meta.num_selectors,
         num_simple_selectors: meta.num_simple_selectors,
         num_permutation_columns: meta.permutation.columns.len(),
+        num_vk_commitment: meta.num_fixed_columns
+            + meta.num_selectors
+            + meta.permutation.columns.len(),
         degree: meta.degree(),
         blinding_factors: meta.blinding_factors(),
         num_challenges: meta.num_challenges(),
@@ -333,7 +379,7 @@ pub(crate) fn circuit_stats<F: Field>(meta: &ConstraintSystem<F>) -> CircuitStat
 /// - 3 comes from minimum number of distinct queries to permutation argument witness column
 /// - 1 comes from queries at x_3 during multiopen
 /// - 1 comes as slight defense against off-by-one errors
-/// - 1 comes from reservation for last row for grand-product boundray check, hence not copy-able or
+/// - 1 comes from reservation for last row for grand-product boundary check, hence not copy-able or
 ///   lookup-able. Note this 1 is not considered in [`ConstraintSystem::blinding_factors`], so below
 ///   we need to add an extra 1.
 ///

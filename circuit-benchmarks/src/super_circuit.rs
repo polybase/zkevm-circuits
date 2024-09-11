@@ -48,7 +48,7 @@ mod tests {
             STOP
         };
 
-        let wallet_a = LocalWallet::new(&mut rng).with_chain_id(*MOCK_CHAIN_ID);
+        let wallet_a = LocalWallet::new(&mut rng).with_chain_id(MOCK_CHAIN_ID);
 
         let addr_a = wallet_a.address();
         let addr_b = address!("0x000000000000000000000000000000000000BBBB");
@@ -90,7 +90,7 @@ mod tests {
             max_rlp_rows: 256,
             ..Default::default()
         };
-        let (_, circuit, instance, _) =
+        let (_, circuit, instance) =
             SuperCircuit::<_, MAX_TXS, MAX_CALLDATA, MAX_INNER_BLOCKS, 0x100>::build(
                 block,
                 circuits_params,

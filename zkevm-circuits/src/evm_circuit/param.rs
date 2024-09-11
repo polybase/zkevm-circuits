@@ -4,10 +4,10 @@ use halo2_proofs::{
     halo2curves::bn256::Fr,
     plonk::{Circuit, ConstraintSystem},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 // Step dimension
-pub(crate) const STEP_WIDTH: usize = 140;
+pub(crate) const STEP_WIDTH: usize = 154;
 /// Step height
 pub const MAX_STEP_HEIGHT: usize = 21;
 /// The height of the state of a step, used by gates that connect two
@@ -27,16 +27,23 @@ pub(crate) const N_COPY_COLUMNS: usize = 2;
 // Number of copy columns for phase2
 pub(crate) const N_PHASE2_COPY_COLUMNS: usize = 1;
 
-pub(crate) const N_BYTE_LOOKUPS: usize = 26;
+pub(crate) const N_BYTE_LOOKUPS: usize = 48;
 
 /// Amount of lookup columns in the EVM circuit dedicated to lookups.
 pub(crate) const EVM_LOOKUP_COLS: usize = FIXED_TABLE_LOOKUPS
     + TX_TABLE_LOOKUPS
     + RW_TABLE_LOOKUPS
     + BYTECODE_TABLE_LOOKUPS
+    // only add when feature 'dual-bytecode' is enabled
+    + if cfg!(feature = "dual-bytecode"){
+        BYTECODE_TABLE_LOOKUPS
+    }else{
+        0
+    }
     + BLOCK_TABLE_LOOKUPS
     + COPY_TABLE_LOOKUPS
     + KECCAK_TABLE_LOOKUPS
+    + SHA256_TABLE_LOOKUPS
     + EXP_TABLE_LOOKUPS
     + SIG_TABLE_LOOKUPS
     + MODEXP_TABLE_LOOKUPS
@@ -52,11 +59,14 @@ pub(crate) const LOOKUP_CONFIG: &[(Table, usize)] = &[
     (Table::Block, BLOCK_TABLE_LOOKUPS),
     (Table::Copy, COPY_TABLE_LOOKUPS),
     (Table::Keccak, KECCAK_TABLE_LOOKUPS),
+    (Table::Sha256, SHA256_TABLE_LOOKUPS),
     (Table::Exp, EXP_TABLE_LOOKUPS),
     (Table::Sig, SIG_TABLE_LOOKUPS),
     (Table::ModExp, MODEXP_TABLE_LOOKUPS),
     (Table::Ecc, ECC_TABLE_LOOKUPS),
     (Table::PowOfRand, POW_OF_RAND_TABLE_LOOKUPS),
+    #[cfg(feature = "dual-bytecode")]
+    (Table::Bytecode1, BYTECODE_TABLE_LOOKUPS),
 ];
 
 /// Fixed Table lookups done in EVMCircuit
@@ -79,6 +89,9 @@ pub const COPY_TABLE_LOOKUPS: usize = 1;
 
 /// Keccak Table lookups done in EVMCircuit
 pub const KECCAK_TABLE_LOOKUPS: usize = 1;
+
+/// Keccak Table lookups done in EVMCircuit
+pub const SHA256_TABLE_LOOKUPS: usize = 1;
 
 /// Exp Table lookups done in EVMCircuit
 pub const EXP_TABLE_LOOKUPS: usize = 1;
@@ -112,7 +125,7 @@ pub(crate) const N_BITS_U8: usize = 8;
 pub(crate) const N_BYTES_ACCOUNT_ADDRESS: usize = 20;
 
 // Number of bytes that will be used of the memory address and size.
-// If any of the other more signficant bytes are used it will always result in
+// If any of the other more significant bytes are used it will always result in
 // an out-of-gas error.
 pub(crate) const N_BYTES_MEMORY_ADDRESS: usize = 5;
 pub(crate) const N_BYTES_MEMORY_WORD_SIZE: usize = 4;
@@ -122,7 +135,7 @@ pub(crate) const N_BYTES_MEMORY_CHUNK: usize = N_BYTES_WORD;
 
 pub(crate) const STACK_CAPACITY: usize = 1024;
 
-// Number of bytes that will be used of prorgam counter. Although the maximum
+// Number of bytes that will be used of program counter. Although the maximum
 // size of execution bytecode could be at most 128kB due to the size limit of a
 // transaction, which could be covered by 3 bytes, we still support program
 // counter to u64 as go-ethereum in case transaction size is allowed larger in
@@ -135,10 +148,10 @@ pub(crate) const N_BYTES_GAS: usize = N_BYTES_U64;
 // Number of bytes that will be used for call data's size.
 pub(crate) const N_BYTES_CALLDATASIZE: usize = N_BYTES_U64;
 
-lazy_static::lazy_static! {
-    // Step slot height in evm circuit
-    pub(crate) static ref EXECUTION_STATE_HEIGHT_MAP : HashMap<ExecutionState, usize> = get_step_height_map();
-}
+// Step slot height in evm circuit
+pub(crate) static EXECUTION_STATE_HEIGHT_MAP: LazyLock<HashMap<ExecutionState, usize>> =
+    LazyLock::new(get_step_height_map);
+
 fn get_step_height_map() -> HashMap<ExecutionState, usize> {
     let mut meta = ConstraintSystem::<Fr>::default();
     let circuit = EvmCircuit::configure(&mut meta);
